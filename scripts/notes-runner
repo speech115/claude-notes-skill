@@ -1,0 +1,3628 @@
+#!/usr/bin/env python3
+"""notes-runner — deterministic wrapper around the notes skill shell scripts."""
+
+from __future__ import annotations
+
+import argparse
+import html
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+NOTES_SKILL_ROOT = Path(
+    os.environ.get("NOTES_SKILL_ROOT", str(SCRIPT_PATH.parent.parent))
+).expanduser()
+PREPARE_SCRIPT = NOTES_SKILL_ROOT / "prepare.sh"
+ASSEMBLE_SCRIPT = NOTES_SKILL_ROOT / "assemble.sh"
+NOTES_CONFIG_PATH = NOTES_SKILL_ROOT / "config.json"
+ADVANCED_DOC_PATH = NOTES_SKILL_ROOT / "ADVANCED.md"
+PREPARE_STATE_FILENAMES = ("prepare_state.json",)
+PREPARE_PLAN_FILENAMES = ("prepare_plan.json",)
+CHUNK_BLOCK_PATTERN = re.compile(r"^chunk_([A-Za-z0-9]+)_block_\d+\.md$")
+MANIFEST_PATTERN = re.compile(r"^manifest_chunk_([A-Za-z0-9]+)\.tsv$")
+VTT_TIMING_RE = re.compile(
+    r"(?P<start>\d{2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})\s+-->\s+(?P<end>\d{2}:\d{2}:\d{2}\.\d{3}|\d{2}:\d{2}\.\d{3})"
+)
+LANGUAGE_CODE_RE = re.compile(r"\.([a-z]{2}(?:-[A-Za-z0-9]+)?)(?:-orig)?\.vtt$", re.IGNORECASE)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+DEFAULT_TELEGRAM_MCP_URL = "http://127.0.0.1:8799/mcp"
+DEFAULT_TELEGRAM_CAPTION_TEMPLATE = ""
+MARKDOWN_H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$")
+
+
+def advanced_setup_message(feature: str, hint: str | None = None) -> str:
+    parts = [f"{feature} is part of advanced setup."]
+    if hint:
+        parts.append(hint.rstrip(".") + ".")
+    parts.append(f"See {ADVANCED_DOC_PATH}.")
+    return " ".join(parts)
+
+
+def python_module_available(module_name: str) -> bool:
+    return importlib.util.find_spec(module_name) is not None
+
+
+def is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def ensure_audio_transcription_available(feature_name: str) -> None:
+    """Check that at least one transcription backend is available."""
+    if os.environ.get("GROQ_API_KEY"):
+        return
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        return
+    if is_macos() and python_module_available("mlx_whisper"):
+        return
+    if is_macos():
+        raise FileNotFoundError(
+            advanced_setup_message(
+                feature_name,
+                "Install mlx-whisper (`pip install mlx-whisper`) or set GROQ_API_KEY (free at console.groq.com)",
+            )
+        )
+    raise FileNotFoundError(
+        advanced_setup_message(
+            feature_name,
+            "Set GROQ_API_KEY (free at console.groq.com). MLX Whisper is macOS-only.",
+        )
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="notes-runner",
+        description="Run deterministic helper steps for the notes transcript pipeline.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prepare_parser = subparsers.add_parser("prepare", help="Run prepare.sh and summarize the result.")
+    prepare_parser.add_argument("files", nargs="+", help="Transcript files.")
+    prepare_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
+
+    status_parser = subparsers.add_parser("status", help="Inspect a notes work directory.")
+    status_parser.add_argument("work_dir", help="Work directory path.")
+    status_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON status.")
+
+    replace_speakers_parser = subparsers.add_parser(
+        "replace-speakers",
+        help="Replace Speaker N labels with real names from speakers.txt.",
+    )
+    replace_speakers_parser.add_argument("work_dir", help="Work directory path.")
+    replace_speakers_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON result.")
+
+    assemble_parser = subparsers.add_parser("assemble", help="Run assemble.sh for an existing work dir.")
+    assemble_parser.add_argument("work_dir", help="Work directory path.")
+    assemble_parser.add_argument("output_md", help="Output markdown path.")
+    assemble_parser.add_argument("output_html", help="Output HTML path.")
+    assemble_parser.add_argument("title", help="Document title.")
+    assemble_parser.add_argument("--send-to", default=None, help="Override Telegram chat target (e.g. @username or chat_id)")
+    assemble_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON result.")
+
+    youtube_parser = subparsers.add_parser(
+        "youtube",
+        help="Create a reusable notes bundle from a YouTube URL.",
+    )
+    youtube_parser.add_argument("url", help="YouTube video URL.")
+    youtube_parser.add_argument(
+        "--output-root",
+        default=str(Path.home() / "Downloads" / "конспекты"),
+        help="Root directory for stored notes bundles.",
+    )
+    youtube_parser.add_argument(
+        "--transcribe-backend",
+        choices=("auto", "groq", "elevenlabs"),
+        default="auto",
+        help="API backend for subtitle fallback transcription.",
+    )
+    youtube_parser.add_argument(
+        "--language",
+        choices=("auto", "en", "ru"),
+        default="auto",
+        help="Optional language hint for API transcription.",
+    )
+    youtube_parser.add_argument(
+        "--prepare",
+        action="store_true",
+        default=False,
+        help="Run notes prepare.sh after transcript creation and link work/ into the bundle.",
+    )
+    youtube_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Refresh transcript artifacts even if the bundle already exists.",
+    )
+    youtube_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
+
+    local_parser = subparsers.add_parser(
+        "local",
+        help="Create a reusable notes bundle from a local markdown/text file.",
+    )
+    local_parser.add_argument("path", help="Local markdown or text file.")
+    local_parser.add_argument(
+        "--output-root",
+        default=str(Path.home() / "Downloads" / "конспекты"),
+        help="Root directory for stored notes bundles.",
+    )
+    local_parser.add_argument(
+        "--title",
+        default=None,
+        help="Override title for bundle directory naming (instead of first line of file).",
+    )
+    local_parser.add_argument(
+        "--prepare",
+        action="store_true",
+        default=False,
+        help="Run notes prepare.sh after transcript creation and link work/ into the bundle.",
+    )
+    local_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Refresh transcript artifacts even if the bundle already exists.",
+    )
+    local_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
+
+    audio_parser = subparsers.add_parser(
+        "audio",
+        help="Create a reusable notes bundle from a local audio file (.m4a, .mp3, .wav, .ogg, .opus).",
+    )
+    audio_parser.add_argument("path", help="Local audio file path.")
+    audio_parser.add_argument(
+        "--output-root",
+        default=str(Path.home() / "Downloads" / "конспекты"),
+        help="Root directory for stored notes bundles.",
+    )
+    audio_parser.add_argument(
+        "--title",
+        default=None,
+        help="Override title for bundle directory naming (instead of filename stem).",
+    )
+    audio_parser.add_argument(
+        "--model",
+        default="mlx-community/whisper-large-v3-turbo",
+        help="Whisper model for transcription.",
+    )
+    audio_parser.add_argument(
+        "--language",
+        default="ru",
+        help="Language hint for whisper transcription.",
+    )
+    audio_parser.add_argument(
+        "--prepare",
+        action="store_true",
+        default=False,
+        help="Run notes prepare.sh after transcript creation and link work/ into the bundle.",
+    )
+    audio_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Re-transcribe even if transcript already exists.",
+    )
+    audio_parser.add_argument(
+        "--transcribe-backend",
+        choices=("auto", "groq", "elevenlabs"),
+        default="auto",
+        help="API backend for transcription. When set, uses API instead of local whisper.",
+    )
+    audio_parser.add_argument(
+        "--diarize",
+        action="store_true",
+        default=False,
+        help="Run speaker diarization via whisperx (requires whisperx installed).",
+    )
+    audio_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
+
+    telegram_parser = subparsers.add_parser(
+        "telegram",
+        help="Download a voice/audio message from Telegram and create a notes bundle.",
+    )
+    telegram_parser.add_argument("chat", help="Chat identifier (@username, phone, or numeric ID).")
+    telegram_parser.add_argument("message_id", type=int, help="Message ID to download.")
+    telegram_parser.add_argument(
+        "--mcp-url",
+        default=DEFAULT_TELEGRAM_MCP_URL,
+        help="Telegram MCP server URL.",
+    )
+    telegram_parser.add_argument(
+        "--output-root",
+        default=str(Path.home() / "Downloads" / "конспекты"),
+        help="Root directory for stored notes bundles.",
+    )
+    telegram_parser.add_argument(
+        "--model",
+        default="mlx-community/whisper-large-v3-turbo",
+        help="Whisper model for transcription.",
+    )
+    telegram_parser.add_argument(
+        "--language",
+        default="ru",
+        help="Language hint for whisper transcription.",
+    )
+    telegram_parser.add_argument(
+        "--prepare",
+        action="store_true",
+        default=False,
+        help="Run notes prepare.sh after transcript creation.",
+    )
+    telegram_parser.add_argument(
+        "--diarize",
+        action="store_true",
+        default=False,
+        help="Run speaker diarization via whisperx (requires whisperx installed).",
+    )
+    telegram_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
+
+    auto_parser = subparsers.add_parser(
+        "auto",
+        help="Auto-detect input type (YouTube URL, audio file, or text file) and route accordingly.",
+    )
+    auto_parser.add_argument("input", help="File path or YouTube URL.")
+    auto_parser.add_argument(
+        "--output-root",
+        default=str(Path.home() / "Downloads" / "конспекты"),
+        help="Root directory for stored notes bundles.",
+    )
+    auto_parser.add_argument(
+        "--model",
+        default="mlx-community/whisper-large-v3-turbo",
+        help="Whisper model for audio transcription.",
+    )
+    auto_parser.add_argument(
+        "--language",
+        default="auto",
+        help="Language hint for transcription.",
+    )
+    auto_parser.add_argument(
+        "--transcribe-backend",
+        choices=("auto", "groq", "elevenlabs"),
+        default="auto",
+        help="API backend for YouTube subtitle fallback transcription.",
+    )
+    auto_parser.add_argument(
+        "--prepare",
+        action="store_true",
+        default=False,
+        help="Run notes prepare.sh after transcript creation.",
+    )
+    auto_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Refresh/re-transcribe even if artifacts already exist.",
+    )
+    auto_parser.add_argument(
+        "--diarize",
+        action="store_true",
+        default=False,
+        help="Run speaker diarization via whisperx (requires whisperx installed).",
+    )
+    auto_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
+
+    batch_parser = subparsers.add_parser(
+        "batch",
+        help="Process multiple audio/text files from a directory into notes bundles.",
+    )
+    batch_parser.add_argument("directory", help="Directory containing audio or text files to process.")
+    batch_parser.add_argument(
+        "--output-root",
+        default=str(Path.home() / "Downloads" / "конспекты"),
+        help="Root directory for stored notes bundles.",
+    )
+    batch_parser.add_argument(
+        "--model",
+        default="mlx-community/whisper-large-v3-turbo",
+        help="Whisper model for audio transcription.",
+    )
+    batch_parser.add_argument(
+        "--language",
+        default="auto",
+        help="Language hint for transcription.",
+    )
+    batch_parser.add_argument(
+        "--transcribe-backend",
+        choices=("auto", "groq", "elevenlabs"),
+        default="auto",
+        help="API backend for transcription.",
+    )
+    batch_parser.add_argument(
+        "--prepare",
+        action="store_true",
+        default=False,
+        help="Run prepare after each transcription.",
+    )
+    batch_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        default=False,
+        help="Re-transcribe even if transcript already exists.",
+    )
+    batch_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
+
+    doctor_parser = subparsers.add_parser("doctor", help="Check prerequisites and environment.")
+    doctor_parser.add_argument("--json", action="store_true", default=False, help="Output as JSON.")
+
+    return parser
+
+
+def ensure_file(path: Path, label: str) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} not found: {resolved}")
+    return resolved
+
+
+def ensure_dir(path: Path, label: str) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"{label} not found: {resolved}")
+    return resolved
+
+
+def ensure_parent_dir(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def resolve_yt_dlp_bin() -> str:
+    override = os.environ.get("NOTES_RUNNER_YTDLP_BIN")
+    if override:
+        return str(Path(override).expanduser())
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+    raise FileNotFoundError("yt-dlp not found. Install it or set NOTES_RUNNER_YTDLP_BIN.")
+
+
+def resolve_transcribe_cli() -> Path:
+    override = os.environ.get("NOTES_RUNNER_TRANSCRIBE_CLI")
+    if override:
+        resolved = Path(override).expanduser()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"NOTES_RUNNER_TRANSCRIBE_CLI points to a missing file: {resolved}")
+        return resolved
+
+    bundled = NOTES_SKILL_ROOT / "scripts" / "transcribe_diarize.py"
+    if bundled.is_file():
+        return bundled
+
+    raise FileNotFoundError(
+        advanced_setup_message(
+            "YouTube transcription fallback",
+            "Starter mode only supports videos with subtitles/autosubs. To enable fallback transcription, set NOTES_RUNNER_TRANSCRIBE_CLI",
+        )
+    )
+
+
+def resolve_digest_runner() -> Path:
+    override = os.environ.get("NOTES_RUNNER_DIGEST_RUNNER")
+    if override:
+        resolved = Path(override).expanduser()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"NOTES_RUNNER_DIGEST_RUNNER points to a missing file: {resolved}")
+        return resolved
+
+    found = shutil.which("digest-runner")
+    if found:
+        return Path(found)
+
+    raise FileNotFoundError(
+        advanced_setup_message(
+            "Telegram delivery",
+            "Install a compatible digest-runner and set NOTES_RUNNER_DIGEST_RUNNER if it is not in PATH",
+        )
+    )
+
+
+def run_command(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def run_checked(command: list[str], *, cwd: Path | None = None, label: str) -> subprocess.CompletedProcess[str]:
+    result = run_command(command, cwd=cwd)
+    if result.returncode != 0:
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        detail = stderr or stdout or f"exit code {result.returncode}"
+        raise ValueError(f"{label} failed: {detail}")
+    return result
+
+
+def slugify(value: str, *, max_length: int = 72) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-")
+    if not slug:
+        slug = "notes"
+    return slug[:max_length].rstrip("-") or "notes"
+
+
+def extract_youtube_metadata(url: str) -> dict:
+    result = run_checked(
+        [resolve_yt_dlp_bin(), "--dump-single-json", "--skip-download", url],
+        label="yt-dlp metadata fetch",
+    )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"yt-dlp metadata was not valid JSON: {exc}") from exc
+
+
+def bundle_dir_for(metadata: dict, output_root: Path) -> Path:
+    video_id = str(metadata.get("id") or "").strip()
+    title = str(metadata.get("title") or video_id or "youtube-notes").strip()
+    folder_name = f"{video_id}-{slugify(title)}" if video_id else slugify(title)
+    return output_root / folder_name
+
+
+def local_bundle_dir_for(source_path: Path, title: str, output_root: Path) -> Path:
+    path_hash = hashlib.sha1(str(source_path.expanduser().resolve()).encode("utf-8")).hexdigest()[:8]
+    return output_root / f"{slugify(title)}-{path_hash}"
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_text(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def extract_youtube_chapters(metadata: dict) -> list[dict]:
+    """Extract chapter markers from YouTube metadata.
+
+    Checks yt-dlp's structured chapters first, then falls back to parsing
+    the video description for timestamp patterns like ``0:00 Introduction``.
+
+    Returns a list of ``{"timestamp": "MM:SS", "title": "...", "seconds": int}``.
+    """
+
+    def _ts_to_seconds(ts: str) -> int:
+        parts = ts.split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        return int(parts[0]) * 60 + int(parts[1])
+
+    def _seconds_to_ts(s: int) -> str:
+        m, sec = divmod(s, 60)
+        return f"{m}:{sec:02d}"
+
+    # --- Source 1: yt-dlp structured chapters ---
+    raw_chapters = metadata.get("chapters")
+    if raw_chapters and isinstance(raw_chapters, list):
+        result: list[dict] = []
+        for ch in raw_chapters:
+            start = ch.get("start_time")
+            title = ch.get("title", "").strip()
+            if start is not None and title:
+                seconds = int(start)
+                result.append({
+                    "timestamp": _seconds_to_ts(seconds),
+                    "title": title,
+                    "seconds": seconds,
+                })
+        if result:
+            return result
+
+    # --- Source 2: parse description ---
+    description = metadata.get("description") or ""
+    chapter_re = re.compile(r"^(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)$", re.MULTILINE)
+    matches = chapter_re.findall(description)
+    if len(matches) >= 2:
+        return [
+            {
+                "timestamp": ts.strip(),
+                "title": title.strip(),
+                "seconds": _ts_to_seconds(ts.strip()),
+            }
+            for ts, title in matches
+        ]
+
+    return []
+
+
+def load_notes_config() -> dict:
+    if not NOTES_CONFIG_PATH.is_file():
+        return {}
+    try:
+        payload = load_json(NOTES_CONFIG_PATH)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Notes config is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Notes config must be a JSON object: {NOTES_CONFIG_PATH}")
+    return payload
+
+
+def read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def infer_local_title(source_path: Path) -> str:
+    for raw_line in read_text_file(source_path).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        heading_match = MARKDOWN_H1_RE.match(line)
+        if heading_match:
+            return heading_match.group(1).strip()
+        return line
+    return source_path.stem
+
+
+def normalize_vtt_timestamp(value: str) -> float:
+    try:
+        parts = value.split(":")
+        if len(parts) == 1:
+            return float(parts[0])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def format_mmss(seconds_value: object) -> str:
+    try:
+        total_seconds = max(0, int(float(seconds_value)))
+    except (TypeError, ValueError):
+        return "00:00"
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def clean_caption_text(lines: list[str]) -> str:
+    text = " ".join(line.strip() for line in lines if line.strip())
+    text = HTML_TAG_RE.sub("", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def parse_vtt(path: Path) -> list[dict]:
+    cues: list[dict] = []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    index = 0
+    last_text = None
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line or line in {"WEBVTT"} or line.startswith(("Kind:", "Language:", "NOTE", "STYLE")):
+            index += 1
+            continue
+        timing_match = VTT_TIMING_RE.search(line)
+        if not timing_match and index + 1 < len(lines):
+            timing_match = VTT_TIMING_RE.search(lines[index + 1].strip())
+            if timing_match:
+                index += 1
+        if not timing_match:
+            index += 1
+            continue
+        start_seconds = normalize_vtt_timestamp(timing_match.group("start"))
+        index += 1
+        text_lines: list[str] = []
+        while index < len(lines) and lines[index].strip():
+            text_lines.append(lines[index].rstrip())
+            index += 1
+        text = clean_caption_text(text_lines)
+        if text and text != last_text:
+            cues.append({"start": start_seconds, "text": text})
+            last_text = text
+    return cues
+
+
+def subtitle_language_from_path(path: Path) -> str | None:
+    match = LANGUAGE_CODE_RE.search(path.name)
+    if not match:
+        return None
+    return match.group(1).split("-")[0].lower()
+
+
+def subtitle_quality_ok(cues: list[dict], duration_seconds: int | None) -> bool:
+    if not cues:
+        return False
+    cue_count = len(cues)
+    total_chars = sum(len(str(item.get("text") or "")) for item in cues)
+    if duration_seconds is not None and duration_seconds <= 300:
+        return cue_count >= 2 and total_chars >= 20
+    return cue_count >= 20 and total_chars >= 400
+
+
+def select_best_subtitle(subs_dir: Path, duration_seconds: int | None) -> tuple[Path | None, list[dict], str | None]:
+    candidates: list[tuple[tuple[int, int], Path, list[dict], str | None]] = []
+    for path in sorted(subs_dir.glob("*.vtt")):
+        cues = parse_vtt(path)
+        if not subtitle_quality_ok(cues, duration_seconds):
+            continue
+        language = subtitle_language_from_path(path)
+        language_rank = {"ru": 0, "en": 1}.get(language or "", 2)
+        candidates.append(((language_rank, -sum(len(item["text"]) for item in cues)), path, cues, language))
+    if not candidates:
+        return None, [], None
+    candidates.sort(key=lambda item: item[0])
+    _, path, cues, language = candidates[0]
+    return path, cues, language
+
+
+def try_youtube_transcript_api(video_id: str, duration_seconds: int | None) -> tuple[list[dict], str | None, str | None]:
+    """Try to fetch transcript via youtube-transcript-api (fast, no audio download).
+
+    Returns (cues, language, error). On success error is None.
+    """
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        return [], None, "youtube-transcript-api not installed"
+    try:
+        api = YouTubeTranscriptApi()
+        languages = ["ru", "en"]
+        transcript = api.fetch(video_id, languages=languages)
+        snippets = list(transcript)
+        cues = [{"start": s.start, "text": s.text} for s in snippets if s.text.strip()]
+        language = transcript.language if hasattr(transcript, "language") else None
+        # Normalize language to 2-letter code
+        if language:
+            language = "ru" if "russian" in language.lower() or language.lower().startswith("ru") else \
+                       "en" if "english" in language.lower() or language.lower().startswith("en") else \
+                       language[:2].lower()
+        if not subtitle_quality_ok(cues, duration_seconds):
+            return [], None, "transcript too short or empty"
+        return cues, language, None
+    except Exception as exc:
+        return [], None, str(exc)
+
+
+def transcript_markdown_from_cues(cues: list[dict]) -> str:
+    lines = [f"*{format_mmss(item['start'])}* {item['text']}" for item in cues if item.get("text")]
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
+
+
+def choose_transcribe_backend(choice: str) -> str:
+    normalized = choice.strip().lower()
+    if normalized != "auto":
+        return normalized
+    if os.environ.get("GROQ_API_KEY"):
+        return "groq"
+    if os.environ.get("ELEVENLABS_API_KEY"):
+        return "elevenlabs"
+    hint = "Set GROQ_API_KEY (free at console.groq.com) or ELEVENLABS_API_KEY."
+    if is_macos():
+        hint += " Or install mlx-whisper for local transcription: pip install mlx-whisper"
+    raise ValueError(hint)
+
+
+def call_transcribe_helper(audio_path: Path, raw_output_path: Path, *, backend: str, language: str | None) -> dict:
+    helper = resolve_transcribe_cli()
+    model = "nova-3" if backend == "deepgram" else "gpt-4o-transcribe-diarize"
+    command = [
+        sys.executable,
+        str(helper),
+        str(audio_path),
+        "--backend",
+        backend,
+        "--model",
+        model,
+        "--response-format",
+        "diarized_json",
+        "--out",
+        str(raw_output_path),
+    ]
+    if language:
+        command.extend(["--language", language])
+    result = run_checked(command, label="transcribe helper")
+    try:
+        payload = json.loads(raw_output_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Transcription output was not valid JSON: {exc}") from exc
+    if result.stdout.strip():
+        payload["_stdout"] = result.stdout.strip()
+    return payload
+
+
+ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+
+
+def call_elevenlabs_transcribe(
+    audio_path: Path,
+    raw_output_path: Path,
+    *,
+    language: str | None,
+) -> dict:
+    """Transcribe audio via ElevenLabs Scribe v2 API with diarization."""
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise ValueError("ELEVENLABS_API_KEY not set.")
+
+    import http.client
+    import mimetypes
+
+    content_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
+    boundary = f"----NotesBoundary{hashlib.md5(str(audio_path).encode()).hexdigest()[:16]}"
+
+    fields: list[tuple[str, str]] = [
+        ("model_id", "scribe_v2"),
+        ("diarize", "true"),
+        ("timestamps_granularity", "word"),
+        ("tag_audio_events", "false"),
+    ]
+    if language:
+        lang_map = {"ru": "rus", "en": "eng"}
+        fields.append(("language_code", lang_map.get(language, language)))
+
+    body = b""
+    for name, value in fields:
+        body += f"--{boundary}\r\n".encode()
+        body += f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode()
+        body += f"{value}\r\n".encode()
+
+    body += f"--{boundary}\r\n".encode()
+    body += f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode()
+    body += f"Content-Type: {content_type}\r\n\r\n".encode()
+    body += audio_path.read_bytes()
+    body += f"\r\n--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        ELEVENLABS_STT_URL,
+        data=body,
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+        raise ValueError(f"ElevenLabs API error ({exc.code}): {detail}") from exc
+
+    write_json(raw_output_path, payload)
+    return payload
+
+
+def elevenlabs_payload_to_transcript_markdown(payload: dict) -> str:
+    """Convert ElevenLabs Scribe v2 response to transcript markdown with speaker labels."""
+    words = payload.get("words")
+    if not isinstance(words, list) or not words:
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            return f"**Speaker 1** *00:00* {text.strip()}\n"
+        raise ValueError("ElevenLabs response contains no words or text.")
+
+    # Build speaker mapping: speaker_0 -> Speaker 1, etc.
+    raw_speakers: set[str] = set()
+    for w in words:
+        sid = w.get("speaker_id")
+        if isinstance(sid, str) and sid:
+            raw_speakers.add(sid)
+    sorted_speakers = sorted(raw_speakers)
+    speaker_map = {raw: f"Speaker {idx + 1}" for idx, raw in enumerate(sorted_speakers)}
+
+    # Group words into utterances by speaker
+    utterances: list[dict] = []
+    current_speaker: str | None = None
+    current_words: list[str] = []
+    current_start: float = 0.0
+
+    for w in words:
+        if w.get("type") != "word":
+            continue
+        text = w.get("text", "").strip()
+        if not text:
+            continue
+        sid = w.get("speaker_id") or ""
+        speaker = speaker_map.get(sid, "Speaker 1")
+        start = w.get("start", 0.0)
+
+        if speaker != current_speaker:
+            if current_words:
+                utterances.append({
+                    "speaker": current_speaker or "Speaker 1",
+                    "start": current_start,
+                    "text": " ".join(current_words),
+                })
+            current_speaker = speaker
+            current_words = [text]
+            current_start = start
+        else:
+            current_words.append(text)
+
+    if current_words:
+        utterances.append({
+            "speaker": current_speaker or "Speaker 1",
+            "start": current_start,
+            "text": " ".join(current_words),
+        })
+
+    lines = [
+        f"**{u['speaker']}** *{format_mmss(u['start'])}* {u['text']}"
+        for u in utterances
+    ]
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
+
+
+GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+GROQ_MAX_WAIT_SEC = 120  # Fall back to MLX if rate limit wait exceeds this
+GROQ_CHUNK_DURATION_SEC = 1800  # 30-minute chunks for splitting large files
+
+
+def _groq_transcribe_single(audio_path: Path, *, api_key: str, language: str | None) -> dict:
+    """Transcribe a single audio file (must be under 25 MB) via Groq API."""
+    command = [
+        "curl", "-s", "--max-time", "600",
+        GROQ_STT_URL,
+        "-H", f"Authorization: Bearer {api_key}",
+        "-F", f"file=@{audio_path}",
+        "-F", "model=whisper-large-v3-turbo",
+        "-F", "response_format=verbose_json",
+    ]
+    if language:
+        command.extend(["-F", f"language={language}"])
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=660)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+        raise ValueError(f"Groq API error: {detail}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Groq response was not valid JSON: {exc}") from exc
+
+    if "error" in payload:
+        err = payload["error"]
+        msg = err.get("message", str(err))
+        # Extract retry-after hint from rate limit messages
+        if err.get("code") == "rate_limit_exceeded":
+            raise RateLimitError(msg)
+        raise ValueError(f"Groq API error: {msg}")
+
+    return payload
+
+
+class RateLimitError(ValueError):
+    """Raised when Groq rate limit is hit, so callers can back off."""
+    pass
+
+
+def _split_audio_ffmpeg(audio_path: Path, output_dir: Path, chunk_seconds: int) -> list[tuple[Path, float]]:
+    """Split audio into chunks with ffmpeg. Returns list of (chunk_path, start_offset_seconds)."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_path)],
+            capture_output=True, text=True, check=True,
+        )
+    except FileNotFoundError:
+        raise ValueError("ffprobe not found — install ffmpeg to enable audio splitting") from None
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"ffprobe failed for {audio_path}: {(exc.stderr or '').strip()}") from exc
+    total_duration = float(probe.stdout.strip())
+    num_chunks = math.ceil(total_duration / chunk_seconds)
+
+    chunks: list[tuple[Path, float]] = []
+    for i in range(num_chunks):
+        start = i * chunk_seconds
+        chunk_path = output_dir / f"chunk_{i:03d}.mp3"
+        cmd = [
+            "ffmpeg", "-y", "-v", "quiet",
+            "-ss", str(start),
+            "-t", str(chunk_seconds),
+            "-i", str(audio_path),
+            "-ac", "1", "-ar", "16000", "-b:a", "48k",
+            str(chunk_path),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except FileNotFoundError:
+            raise ValueError("ffmpeg not found — install ffmpeg to enable audio splitting") from None
+        except subprocess.CalledProcessError as exc:
+            raise ValueError(f"ffmpeg failed splitting chunk {i} of {audio_path}: {(exc.stderr or '').strip()}") from exc
+        chunks.append((chunk_path, float(start)))
+    return chunks
+
+
+def _merge_groq_payloads(chunk_results: list[tuple[dict, float]]) -> dict:
+    """Merge multiple Groq payloads, adjusting segment timestamps by chunk offsets."""
+    all_segments: list[dict] = []
+    all_text_parts: list[str] = []
+
+    for payload, offset in chunk_results:
+        text = payload.get("text", "")
+        if text:
+            all_text_parts.append(text.strip())
+        for seg in payload.get("segments", []):
+            adjusted = dict(seg)
+            adjusted["start"] = seg.get("start", 0) + offset
+            adjusted["end"] = seg.get("end", 0) + offset
+            all_segments.append(adjusted)
+
+    return {
+        "text": " ".join(all_text_parts),
+        "segments": all_segments,
+        "language": chunk_results[0][0].get("language") if chunk_results else None,
+    }
+
+
+def call_groq_transcribe(
+    audio_path: Path,
+    raw_output_path: Path,
+    *,
+    language: str | None,
+) -> dict:
+    """Transcribe audio via Groq Whisper API. Auto-splits files larger than 25 MB."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not set.")
+
+    file_size = audio_path.stat().st_size
+    if file_size <= GROQ_MAX_FILE_SIZE:
+        payload = _groq_transcribe_single(audio_path, api_key=api_key, language=language)
+        write_json(raw_output_path, payload)
+        return payload
+
+    # Large file — split, transcribe chunks, merge
+    print(f"File is {file_size / 1024 / 1024:.0f} MB — splitting into chunks for Groq API...", file=sys.stderr)
+    with tempfile.TemporaryDirectory(prefix="notes-groq-chunks-") as tmp_dir:
+        chunks = _split_audio_ffmpeg(audio_path, Path(tmp_dir), GROQ_CHUNK_DURATION_SEC)
+        print(f"Split into {len(chunks)} chunks, transcribing...", file=sys.stderr)
+        chunk_results: list[tuple[dict, float]] = []
+        for i, (chunk_path, offset) in enumerate(chunks):
+            print(f"  Chunk {i + 1}/{len(chunks)} ({chunk_path.stat().st_size / 1024 / 1024:.1f} MB)...", file=sys.stderr)
+            payload = None
+            for attempt in range(5):
+                try:
+                    payload = _groq_transcribe_single(chunk_path, api_key=api_key, language=language)
+                    break
+                except RateLimitError as exc:
+                    wait = 180  # default 3 min
+                    match = re.search(r"in (\d+)m(\d+)s", str(exc))
+                    if match:
+                        wait = int(match.group(1)) * 60 + int(match.group(2)) + 5
+                    if wait > GROQ_MAX_WAIT_SEC:
+                        raise RateLimitError(
+                            f"Rate limit wait {wait}s exceeds threshold {GROQ_MAX_WAIT_SEC}s"
+                        ) from exc
+                    print(f"    Rate limit, waiting {wait}s...", file=sys.stderr)
+                    time.sleep(wait)
+                except ValueError as exc:
+                    if attempt < 4:
+                        wait = 10 * (attempt + 1)
+                        print(f"    Retry {attempt + 1}/4 in {wait}s ({exc})...", file=sys.stderr)
+                        time.sleep(wait)
+                    else:
+                        raise
+            if payload is None:
+                raise ValueError("All 5 transcription attempts failed due to rate limiting")
+            chunk_results.append((payload, offset))
+            if i < len(chunks) - 1:
+                time.sleep(2)
+
+    merged = _merge_groq_payloads(chunk_results)
+    write_json(raw_output_path, merged)
+    return merged
+
+
+def groq_payload_to_transcript_markdown(payload: dict) -> str:
+    """Convert Groq Whisper verbose_json response to transcript markdown."""
+    segments = payload.get("segments")
+    if not isinstance(segments, list) or not segments:
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            return f"*00:00* {text.strip()}\n"
+        raise ValueError("Groq response contains no segments or text.")
+
+    lines = [
+        f"*{format_mmss(seg.get('start', 0))}* {seg.get('text', '').strip()}"
+        for seg in segments
+        if isinstance(seg, dict) and seg.get("text", "").strip()
+    ]
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
+
+
+def extract_transcript_segments(payload: dict) -> list[dict]:
+    candidates: list = []
+    for key in ("utterances", "segments"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, dict))
+
+    results = payload.get("results")
+    if isinstance(results, dict):
+        for key in ("utterances", "segments"):
+            value = results.get(key)
+            if isinstance(value, list):
+                candidates.extend(item for item in value if isinstance(item, dict))
+
+    segments: list[dict] = []
+    for item in candidates:
+        text = (
+            item.get("transcript")
+            or item.get("text")
+            or item.get("content")
+        )
+        if not isinstance(text, str) or not text.strip():
+            continue
+        start = item.get("start")
+        if start is None:
+            start = item.get("start_time")
+        if start is None:
+            timestamp = item.get("timestamp")
+            if isinstance(timestamp, (int, float, str)):
+                start = timestamp
+        segments.append(
+            {
+                "start": start if start is not None else 0,
+                "speaker": item.get("speaker"),
+                "text": text.strip(),
+            }
+        )
+    return segments
+
+
+def transcript_markdown_from_api_payload(payload: dict) -> str:
+    segments = extract_transcript_segments(payload)
+    speaker_values = {str(item["speaker"]) for item in segments if item.get("speaker") is not None}
+    multi_speaker = len(speaker_values) > 1
+
+    if segments:
+        lines: list[str] = []
+        for item in segments:
+            prefix = f"*{format_mmss(item['start'])}* "
+            if multi_speaker and item.get("speaker") is not None:
+                lines.append(f"**Speaker {item['speaker']}** {prefix}{item['text']}")
+            else:
+                lines.append(f"{prefix}{item['text']}")
+        return "\n".join(lines).rstrip() + "\n"
+
+    text_candidates = [
+        payload.get("text"),
+        payload.get("transcript"),
+    ]
+    results = payload.get("results")
+    if isinstance(results, dict):
+        channels = results.get("channels")
+        if isinstance(channels, list) and channels:
+            alternatives = channels[0].get("alternatives") if isinstance(channels[0], dict) else None
+            if isinstance(alternatives, list) and alternatives:
+                text_candidates.append(alternatives[0].get("transcript"))
+    for candidate in text_candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip() + "\n"
+    raise ValueError("Transcription payload did not contain usable transcript text.")
+
+
+def run_prepare_for_transcript(transcript_path: Path) -> dict:
+    result = run_prepare_logic([transcript_path])
+    work_dir = Path(result["work_dir"])
+    payload = load_prepare_payload(work_dir)
+    payload["work_dir"] = str(work_dir)
+    return payload
+
+
+def link_bundle_work_dir(bundle_dir: Path, work_dir: Path) -> Path:
+    work_link = bundle_dir / "work"
+    if work_link.exists() or work_link.is_symlink():
+        work_link.unlink()
+    work_link.symlink_to(work_dir)
+    write_text(bundle_dir / "work-dir.txt", str(work_dir) + "\n")
+    return work_link
+
+
+def bundle_paths(bundle_dir: Path) -> dict[str, Path]:
+    return {
+        "metadata": bundle_dir / "metadata.json",
+        "source_url": bundle_dir / "source-url.txt",
+        "source_file": bundle_dir / "source-file.txt",
+        "state": bundle_dir / "run.json",
+        "source_dir": bundle_dir / "source",
+        "subs_dir": bundle_dir / "subs",
+        "audio_dir": bundle_dir / "audio",
+        "transcript": bundle_dir / "transcript.md",
+        "raw_transcript": bundle_dir / "transcript.raw.json",
+        "notes_md": bundle_dir / "конспект.md",
+        "notes_html": bundle_dir / "конспект.html",
+    }
+
+
+def collapse_blank_lines(text: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", text.strip())
+
+
+def sanitize_delivery_name(value: str, *, suffix: str) -> str:
+    normalized = re.sub(r"[\r\n]+", " ", value).strip()
+    normalized = re.sub(r'[<>:"/\\|?*]+', " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip(" .")
+    if not normalized:
+        normalized = "Конспект"
+    return f"{normalized[:120].rstrip(' .')}{suffix}"
+
+
+def load_bundle_context(output_html: Path) -> dict:
+    state_path = output_html.parent / "run.json"
+    if not state_path.is_file():
+        return {}
+    try:
+        payload = load_json(state_path)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def build_source_reference(context: dict) -> str:
+    source_kind = str(context.get("source_kind") or "").strip()
+    source_url = str(context.get("source_url") or "").strip()
+    if source_kind == "youtube" and source_url:
+        return source_url
+    source_name = str(context.get("source_name") or "").strip()
+    if source_kind == "local" and source_name:
+        return f"Файл: {source_name}"
+    return source_url or source_name
+
+
+def default_telegram_caption(*, title: str, context: dict) -> str:
+    source_kind = str(context.get("source_kind") or "").strip()
+    if source_kind == "youtube":
+        lines = [f"📝 Конспект видео: {title}"]
+        reference = build_source_reference(context)
+        if reference:
+            lines.append(reference)
+        return "\n".join(lines)
+    if source_kind == "local":
+        lines = [f"📝 Конспект материала: {title}"]
+        reference = build_source_reference(context)
+        if reference:
+            lines.append(reference)
+        return "\n".join(lines)
+    return f"📝 Конспект: {title}"
+
+
+def render_caption(template: str, *, title: str, output_html: Path, context: dict) -> str:
+    try:
+        rendered = template.format(
+            title=title,
+            file_name=output_html.name,
+            stem=output_html.stem,
+            path=str(output_html),
+            source_url=str(context.get("source_url") or ""),
+            source_name=str(context.get("source_name") or ""),
+            source_kind=str(context.get("source_kind") or ""),
+            source_reference=build_source_reference(context),
+            material_label="видео" if str(context.get("source_kind") or "") == "youtube" else "материала",
+            video_id=str(context.get("video_id") or ""),
+        )
+        return collapse_blank_lines(rendered)
+    except KeyError as exc:
+        raise ValueError(f"Caption template uses unsupported placeholder: {exc}") from exc
+
+
+def build_telegram_delivery_disabled(reason: str) -> dict:
+    return {
+        "enabled": False,
+        "attempted": False,
+        "success": False,
+        "reason": reason,
+    }
+
+
+def deliver_html_to_telegram(output_html: Path, *, title: str, chat_override: str | None = None) -> dict:
+    config = load_notes_config()
+    delivery = config.get("telegram_delivery")
+
+    if chat_override:
+        # When chat_override is provided, bypass config enabled/missing checks
+        if not isinstance(delivery, dict):
+            delivery = {}
+        chat = chat_override.strip()
+    else:
+        if not isinstance(delivery, dict):
+            return build_telegram_delivery_disabled("config-missing")
+        if not delivery.get("enabled", False):
+            return build_telegram_delivery_disabled("disabled")
+        chat = str(delivery.get("chat") or "").strip()
+        if not chat:
+            return {
+                "enabled": True,
+                "attempted": False,
+                "success": False,
+                "error": "notes config missing telegram_delivery.chat",
+            }
+
+    context = load_bundle_context(output_html)
+    caption_template = str(delivery.get("caption_template") or DEFAULT_TELEGRAM_CAPTION_TEMPLATE)
+    if caption_template:
+        caption = render_caption(caption_template, title=title, output_html=output_html, context=context)
+    else:
+        caption = default_telegram_caption(title=title, context=context)
+    parse_mode = str(delivery.get("parse_mode") or "md").strip() or "md"
+    mcp_url = str(delivery.get("mcp_url") or DEFAULT_TELEGRAM_MCP_URL).strip()
+    video_id = str(context.get("video_id") or "").strip()
+    source_kind = str(context.get("source_kind") or "").strip()
+    delivery_file = output_html
+
+    command = [
+        str(resolve_digest_runner()),
+        "send-file",
+        "--input",
+        str(delivery_file),
+        "--chat",
+        chat,
+        "--caption",
+        caption,
+        "--parse-mode",
+        parse_mode,
+        "--mcp-url",
+        mcp_url,
+        "--json",
+    ]
+    result = run_command(command)
+    payload = {
+        "enabled": True,
+        "attempted": True,
+        "success": result.returncode == 0,
+        "chat": chat,
+        "caption": caption,
+        "parse_mode": parse_mode,
+        "mcp_url": mcp_url,
+        "runner": str(resolve_digest_runner()),
+        "file_path": str(delivery_file),
+    }
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0:
+        detail = stderr or stdout or f"exit code {result.returncode}"
+        payload["error"] = f"telegram delivery failed: {detail}"
+        return payload
+    if stdout:
+        try:
+            payload["result"] = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload["stdout"] = stdout
+    return payload
+
+
+def update_bundle_run_state(output_md: Path, output_html: Path, *, title: str, telegram_delivery: dict) -> None:
+    state_path = output_html.parent / "run.json"
+    if not state_path.is_file():
+        return
+    try:
+        payload = load_json(state_path)
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, dict):
+        outputs = {}
+    outputs.update(
+        {
+            "markdown": str(output_md),
+            "html": str(output_html),
+        }
+    )
+    if telegram_delivery.get("file_path"):
+        outputs["telegram_html"] = str(telegram_delivery["file_path"])
+    payload["updated_at"] = datetime.now().isoformat()
+    payload["title"] = title
+    payload["outputs"] = outputs
+    payload["telegram_delivery"] = telegram_delivery
+    write_json(state_path, payload)
+
+
+def download_subtitles(url: str, subs_dir: Path) -> str | None:
+    subs_dir.mkdir(parents=True, exist_ok=True)
+    result = run_command(
+        [
+            resolve_yt_dlp_bin(),
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-format",
+            "vtt",
+            "--sub-langs",
+            "ru.*,en.*,ru,en",
+            "-P",
+            str(subs_dir),
+            "-o",
+            "%(title)s [%(id)s].%(ext)s",
+            url,
+        ],
+    )
+    if result.returncode == 0:
+        return None
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    return stderr or stdout or f"yt-dlp subtitle download failed with exit code {result.returncode}"
+
+
+def download_audio(url: str, audio_dir: Path) -> Path:
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    output_template = audio_dir / "source.%(ext)s"
+    run_checked(
+        [
+            resolve_yt_dlp_bin(),
+            "-f",
+            "bestaudio[ext=m4a]/bestaudio/best",
+            "-o",
+            str(output_template),
+            url,
+        ],
+        label="yt-dlp audio download",
+    )
+    matches = sorted(audio_dir.glob("source.*"))
+    if not matches:
+        raise ValueError(f"yt-dlp audio download produced no files in {audio_dir}")
+    return matches[0]
+
+
+def parse_prepare_report(report_path: Path) -> dict:
+    text = report_path.read_text(encoding="utf-8")
+
+    def extract(pattern: str) -> str | None:
+        match = re.search(pattern, text, flags=re.MULTILINE)
+        return match.group(1).strip() if match else None
+
+    return {
+        "work_dir": extract(r"^WORK_DIR:\s*(.+)$") or str(report_path.parent),
+        "files": int(extract(r"^Files:\s*(\d+)$") or 0),
+        "total_lines": int(extract(r"^Total lines:\s*(\d+)$") or 0),
+        "duration_estimate": extract(r"^Duration estimate:\s*(.+)$") or "unknown",
+        "unique_speakers": int(extract(r"^Unique speakers:\s*(\d+)$") or 0),
+        "total_chunks": int(extract(r"^=== TOTAL CHUNKS:\s*(\d+)\s*===$") or 0),
+        "report_path": str(report_path),
+    }
+
+
+def load_json_file(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def find_prepare_state_path(work_dir: Path) -> Path | None:
+    for filename in PREPARE_STATE_FILENAMES:
+        candidate = work_dir / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def find_prepare_plan_path(work_dir: Path) -> Path | None:
+    for filename in PREPARE_PLAN_FILENAMES:
+        candidate = work_dir / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def normalize_chunk_id(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def normalize_chunk_plan(state: dict | None) -> list[dict]:
+    if not isinstance(state, dict):
+        return []
+
+    raw_plan = state.get("chunk_plan") or []
+    if not isinstance(raw_plan, list):
+        return []
+
+    plan: list[dict] = []
+    for item in raw_plan:
+        if not isinstance(item, dict):
+            continue
+        chunk_id = normalize_chunk_id(item.get("chunk_id") or item.get("id"))
+        if not chunk_id:
+            continue
+        plan.append(
+            {
+                "id": chunk_id,
+                "file": item.get("file"),
+                "line_start": item.get("extraction_start"),
+                "line_end": item.get("extraction_end"),
+                "context_start": item.get("context_start"),
+                "context_end": item.get("context_end"),
+                "status": item.get("status"),
+                "expected_outputs": item.get("expected_outputs") or [],
+            }
+        )
+    return plan
+
+
+def prepare_state_payload(work_dir: Path, state: dict | None, plan_state: dict | None, report_path: Path | None) -> dict:
+    state = state or {}
+    plan_state = plan_state or {}
+    totals = state.get("totals") if isinstance(state.get("totals"), dict) else {}
+    stage_hints = state.get("stage_hints") if isinstance(state.get("stage_hints"), dict) else {}
+    if not stage_hints and state.get("speaker_stage"):
+        stage_hints = {
+            "speaker_identification": state.get("speaker_stage"),
+            "appendix": "deterministic-fallback",
+        }
+
+    stage_statuses = state.get("stage_statuses") if isinstance(state.get("stage_statuses"), dict) else {}
+    if not stage_statuses:
+        speaker_stage = str(state.get("speaker_stage") or "").strip()
+        speaker_status = "skipped" if speaker_stage == "skip" else "missing"
+        stage_statuses = {
+            "speaker_identification": speaker_status,
+            "extraction": "missing",
+            "tldr": "missing",
+            "assemble": "missing",
+        }
+
+    prepare_state_path = find_prepare_state_path(work_dir)
+    prepare_plan_path = find_prepare_plan_path(work_dir)
+    unique_speakers = state.get("unique_speakers") or totals.get("speaker_markers") or 0
+    file_entries = state.get("files")
+    files_count = state.get("files") if isinstance(state.get("files"), int) else totals.get("files")
+    if files_count is None and isinstance(file_entries, list):
+        files_count = len(file_entries)
+
+    payload = {
+        "work_dir": str(state.get("work_dir") or work_dir),
+        "fingerprint": state.get("fingerprint") or state.get("run_fingerprint"),
+        "stage_hints": stage_hints,
+        "stage_statuses": stage_statuses,
+        "chunk_plan": normalize_chunk_plan(state) or normalize_chunk_plan(plan_state),
+        "prepare_state_path": str(prepare_state_path) if prepare_state_path else None,
+        "prepare_plan_path": str(prepare_plan_path) if prepare_plan_path else None,
+        "report_path": str(report_path) if report_path else None,
+        "files": int(files_count or 0),
+        "total_lines": int(state.get("total_lines") or totals.get("lines") or 0),
+        "duration_estimate": state.get("duration_estimate") or totals.get("duration_estimate") or "unknown",
+        "unique_speakers": int(unique_speakers or 0),
+        "total_chunks": int(state.get("total_chunks") or totals.get("chunks") or 0),
+    }
+    if payload["chunk_plan"]:
+        payload["total_chunks"] = len(payload["chunk_plan"])
+    elif report_path:
+        report_payload = parse_prepare_report(report_path)
+        payload.update(
+            {
+                "files": report_payload["files"],
+                "total_lines": report_payload["total_lines"],
+                "duration_estimate": report_payload["duration_estimate"],
+                "unique_speakers": report_payload["unique_speakers"],
+                "total_chunks": report_payload["total_chunks"],
+            }
+        )
+    return payload
+
+
+def load_prepare_payload(work_dir: Path) -> dict:
+    state_path = find_prepare_state_path(work_dir)
+    state = load_json_file(state_path) if state_path else None
+    plan_path = find_prepare_plan_path(work_dir)
+    plan_state = load_json_file(plan_path) if plan_path else None
+    report_path = work_dir / "prepare_report.txt"
+    report = parse_prepare_report(report_path) if report_path.is_file() else None
+
+    if state is not None or plan_state is not None:
+        payload = prepare_state_payload(work_dir, state, plan_state, report_path if report_path.is_file() else None)
+        if report is not None:
+            if not payload.get("files"):
+                payload["files"] = report["files"]
+            if not payload.get("total_lines"):
+                payload["total_lines"] = report["total_lines"]
+            if payload.get("duration_estimate") == "unknown":
+                payload["duration_estimate"] = report["duration_estimate"]
+            if not payload.get("unique_speakers"):
+                payload["unique_speakers"] = report["unique_speakers"]
+            if not payload.get("total_chunks"):
+                payload["total_chunks"] = report["total_chunks"]
+        return payload
+
+    if report is None:
+        raise FileNotFoundError(f"prepare_report.txt not found: {report_path}")
+    return report
+
+
+def collect_chunk_ids_from_files(work_dir: Path) -> set[str]:
+    chunk_ids: set[str] = set()
+    for path in work_dir.glob("chunk_*_block_*.md"):
+        match = CHUNK_BLOCK_PATTERN.match(path.name)
+        if match:
+            chunk_ids.add(match.group(1))
+    for path in work_dir.glob("manifest_chunk_*.tsv"):
+        match = MANIFEST_PATTERN.match(path.name)
+        if match:
+            chunk_ids.add(match.group(1))
+    return chunk_ids
+
+
+def infer_chunk_status(work_dir: Path, chunk_id: str, planned_ids: set[str]) -> str:
+    block_files = sorted(work_dir.glob(f"chunk_{chunk_id}_block_*.md"))
+    manifest_exists = (work_dir / f"manifest_chunk_{chunk_id}.tsv").is_file()
+
+    if chunk_id not in planned_ids:
+        if block_files or manifest_exists:
+            return "stale"
+        return "missing"
+
+    if block_files and manifest_exists:
+        return "ready"
+    if block_files or manifest_exists:
+        return "partial"
+    return "missing"
+
+
+def build_chunk_statuses(work_dir: Path, chunk_plan: list[dict]) -> dict[str, dict]:
+    planned_ids = {normalize_chunk_id(item.get("id")) for item in chunk_plan}
+    planned_ids.discard(None)  # type: ignore[arg-type]
+
+    chunk_ids = planned_ids | collect_chunk_ids_from_files(work_dir)
+    statuses: dict[str, dict] = {}
+    for chunk_id in sorted(chunk_ids):
+        statuses[chunk_id] = {
+            "status": infer_chunk_status(work_dir, chunk_id, planned_ids),
+            "block_files": [str(path) for path in sorted(work_dir.glob(f"chunk_{chunk_id}_block_*.md"))],
+            "manifest": str(work_dir / f"manifest_chunk_{chunk_id}.tsv") if (work_dir / f"manifest_chunk_{chunk_id}.tsv").exists() else None,
+            "planned": chunk_id in planned_ids,
+        }
+    return statuses
+
+
+def stage_status_from_prepare_state(stage_statuses: dict, key: str, default: str) -> str:
+    value = stage_statuses.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+
+def build_stage_statuses(work_dir: Path, payload: dict, chunk_statuses: dict[str, dict]) -> dict[str, dict]:
+    stage_hints = payload.get("stage_hints") if isinstance(payload.get("stage_hints"), dict) else {}
+    explicit = payload.get("stage_statuses") if isinstance(payload.get("stage_statuses"), dict) else {}
+    planned_chunks = [item for item in payload.get("chunk_plan", []) if isinstance(item, dict)]
+    planned_ids = {normalize_chunk_id(item.get("id")) for item in planned_chunks}
+    planned_ids.discard(None)  # type: ignore[arg-type]
+
+    speakers_file = work_dir / "speakers.txt"
+    tldr_file = work_dir / "tldr.md"
+    html_outputs = list(work_dir.glob("*.html"))
+    md_outputs = list(work_dir.glob("*.md"))
+
+    planned_chunk_statuses = [chunk_statuses[chunk_id]["status"] for chunk_id in sorted(planned_ids) if chunk_id in chunk_statuses]
+    if planned_chunk_statuses and all(status == "ready" for status in planned_chunk_statuses):
+        extraction_status = "ready"
+    elif any(status == "stale" for status in planned_chunk_statuses):
+        extraction_status = "stale"
+    elif any(status == "ready" for status in planned_chunk_statuses) or any(status == "partial" for status in planned_chunk_statuses):
+        extraction_status = "partial"
+    elif planned_chunk_statuses:
+        extraction_status = "missing"
+    else:
+        extraction_status = "missing"
+
+    speaker_hint = stage_hints.get("speaker_identification") if isinstance(stage_hints, dict) else None
+    if speaker_hint == "skip":
+        speaker_status = "skipped"
+    elif speakers_file.is_file():
+        speaker_status = "ready"
+    else:
+        speaker_status = stage_status_from_prepare_state(explicit, "speaker_identification", "missing")
+
+    tldr_status = "ready" if tldr_file.is_file() else stage_status_from_prepare_state(explicit, "tldr", "missing")
+    assemble_status = "ready" if html_outputs else stage_status_from_prepare_state(explicit, "assemble", "missing")
+
+    extraction_status = stage_status_from_prepare_state(explicit, "extraction", extraction_status)
+    if extraction_status == "ready" and any(status != "ready" for status in planned_chunk_statuses):
+        extraction_status = "partial"
+
+    return {
+        "speaker_identification": {
+            "status": speaker_status,
+            "hint": speaker_hint,
+        },
+        "extraction": {
+            "status": extraction_status,
+            "planned_chunks": len(planned_ids),
+            "ready_chunks": sum(1 for status in planned_chunk_statuses if status == "ready"),
+            "partial_chunks": sum(1 for status in planned_chunk_statuses if status == "partial"),
+            "missing_chunks": sum(1 for status in planned_chunk_statuses if status == "missing"),
+            "stale_chunks": sum(1 for status in planned_chunk_statuses if status == "stale"),
+        },
+        "tldr": {
+            "status": tldr_status,
+            "exists": tldr_file.is_file(),
+        },
+        "assemble": {
+            "status": assemble_status,
+            "html_outputs": [str(path) for path in html_outputs],
+            "markdown_outputs": [str(path) for path in md_outputs],
+        },
+    }
+
+
+def determine_next_action(stages: dict[str, dict]) -> str:
+    speaker_status = stages["speaker_identification"]["status"]
+    speaker_hint = stages["speaker_identification"].get("hint")
+    extraction_status = stages["extraction"]["status"]
+    tldr_status = stages["tldr"]["status"]
+    assemble_status = stages["assemble"]["status"]
+
+    if speaker_hint == "required" and speaker_status not in {"ready", "skipped"}:
+        return "speaker-identification"
+    if extraction_status != "ready":
+        return "extract-chunks"
+    if tldr_status != "ready":
+        return "generate-tldr"
+    if assemble_status != "ready":
+        return "assemble"
+    return "done"
+
+
+def normalize_language_hint(value: str) -> str | None:
+    normalized = value.strip().lower()
+    if normalized in {"", "auto"}:
+        return None
+    return normalized
+
+
+def normalize_transcript_text(text: str) -> str:
+    """Clean up whisper-generated transcript text.
+
+    Steps:
+    1. Remove <unk> tokens
+    2. Clean up excessive whitespace within lines
+    3. Remove duplicate consecutive lines
+    4. Parse into (speaker, text, timestamp) entries
+    5. Merge fragmented sentences from the same speaker
+    6. Remove empty speaker turns
+    7. Reconstruct markdown format
+    """
+    if not text or not text.strip():
+        return ""
+
+    # Step 1: Remove <unk> tokens
+    text = text.replace("<unk>", "")
+
+    # Step 2: Clean up excessive whitespace within lines (preserve line breaks)
+    lines = text.split("\n")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in lines]
+
+    # Step 3: Remove duplicate consecutive lines
+    deduped: list[str] = []
+    for line in lines:
+        if not deduped or line != deduped[-1]:
+            deduped.append(line)
+    lines = deduped
+
+    # Parse into structured entries: (speaker, text, timestamp)
+    # Format:  **Speaker N**: text\n*HH:MM* or *MM:SS*
+    speaker_re = re.compile(r"^\*\*(.+?)\*\*:\s*(.*)")
+    timestamp_re = re.compile(r"^\*([^*]+)\*$")
+
+    entries: list[dict[str, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        speaker_match = speaker_re.match(line)
+        if speaker_match:
+            speaker = speaker_match.group(1)
+            spoken_text = speaker_match.group(2).strip()
+            # Look ahead for timestamp (possibly with an empty line in between)
+            timestamp = ""
+            if i + 1 < len(lines) and not lines[i + 1]:
+                # Empty line between speaker and timestamp
+                if i + 2 < len(lines):
+                    ts_match = timestamp_re.match(lines[i + 2])
+                    if ts_match:
+                        timestamp = ts_match.group(1)
+                        i += 3
+                        entries.append({"speaker": speaker, "text": spoken_text, "timestamp": timestamp})
+                        continue
+            if i + 1 < len(lines):
+                ts_match = timestamp_re.match(lines[i + 1])
+                if ts_match:
+                    timestamp = ts_match.group(1)
+                    i += 2
+                    entries.append({"speaker": speaker, "text": spoken_text, "timestamp": timestamp})
+                    continue
+            # No timestamp found — still record the entry
+            entries.append({"speaker": speaker, "text": spoken_text, "timestamp": timestamp})
+            i += 1
+            continue
+        i += 1
+
+    # If no structured entries were parsed, return cleaned text as-is
+    if not entries:
+        cleaned = "\n".join(lines).strip()
+        return cleaned + "\n" if cleaned else ""
+
+    # Step 5: Merge fragmented sentences from the same speaker.
+    # If consecutive entries share a speaker and the first doesn't end with
+    # terminal punctuation, merge texts and keep the first timestamp.
+    terminal_punct_re = re.compile(r"[.!?\u2026]$")
+    merged: list[dict[str, str]] = []
+    for entry in entries:
+        if (
+            merged
+            and merged[-1]["speaker"] == entry["speaker"]
+            and merged[-1]["text"]
+            and not terminal_punct_re.search(merged[-1]["text"])
+        ):
+            merged[-1]["text"] = merged[-1]["text"] + " " + entry["text"]
+        else:
+            merged.append(dict(entry))
+    entries = merged
+
+    # Step 6: Remove empty speaker turns (e.g. "**Speaker 1**: ." or whitespace-only)
+    noise_re = re.compile(r"^[.\s,;:]*$")
+    entries = [e for e in entries if e["text"] and not noise_re.match(e["text"])]
+
+    # Step 7: Reconstruct markdown format
+    result_lines: list[str] = []
+    for entry in entries:
+        result_lines.append(f"**{entry['speaker']}**: {entry['text']}")
+        if entry["timestamp"]:
+            result_lines.append(f"*{entry['timestamp']}*")
+        result_lines.append("")  # blank line between entries
+
+    result = "\n".join(result_lines).strip()
+    return result + "\n" if result else ""
+
+
+def copy_local_source(source_path: Path, bundle_dir: Path) -> Path:
+    source_dir = bundle_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    destination = source_dir / source_path.name
+    shutil.copy2(source_path, destination)
+    return destination
+
+
+def cmd_local(args: argparse.Namespace) -> int:
+    source_path = ensure_file(Path(args.path), "Source file")
+    output_root = ensure_parent_dir(Path(args.output_root))
+    title = args.title if getattr(args, "title", None) else infer_local_title(source_path)
+    bundle_dir = local_bundle_dir_for(source_path, title, output_root)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    paths = bundle_paths(bundle_dir)
+
+    source_copy = copy_local_source(source_path, bundle_dir)
+    write_text(paths["source_file"], str(source_path) + "\n")
+    write_json(
+        paths["metadata"],
+        {
+            "title": title,
+            "source_path": str(source_path),
+            "source_name": source_path.name,
+            "source_extension": source_path.suffix.lower(),
+        },
+    )
+
+    transcript_path = paths["transcript"]
+    if args.refresh or not transcript_path.is_file():
+        write_text(transcript_path, normalize_transcript_text(read_text_file(source_path)))
+
+    transcript_source = {
+        "kind": "local-file",
+        "path": str(source_path),
+    }
+    payload: dict[str, object] = {
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "source_kind": "local",
+        "source_path": str(source_path),
+        "source_name": source_path.name,
+        "source_copy_path": str(source_copy),
+        "metadata_path": str(paths["metadata"]),
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+        "suggested_output_md": str(paths["notes_md"]),
+        "suggested_output_html": str(paths["notes_html"]),
+    }
+
+    if args.prepare:
+        prepare_payload = run_prepare_for_transcript(transcript_path)
+        work_dir = ensure_dir(Path(prepare_payload["work_dir"]), "Work directory")
+        work_link = link_bundle_work_dir(bundle_dir, work_dir)
+        payload["prepare"] = prepare_payload
+        payload["work_link"] = str(work_link)
+
+    state_payload = {
+        "updated_at": datetime.now().isoformat(),
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "source_kind": "local",
+        "source_path": str(source_path),
+        "source_name": source_path.name,
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+    }
+    if "prepare" in payload:
+        state_payload["prepare"] = payload["prepare"]
+    write_json(paths["state"], state_payload)
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Bundle: {bundle_dir}")
+    print(f"Title: {title}")
+    print(f"Source: {source_path}")
+    print(f"Transcript: {transcript_path}")
+    print(f"Suggested markdown: {paths['notes_md']}")
+    print(f"Suggested HTML: {paths['notes_html']}")
+    if args.prepare and "prepare" in payload:
+        print(f"Work dir: {payload['prepare']['work_dir']}")
+    return 0
+
+
+AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".ogg", ".opus"}
+VIDEO_EXTENSIONS = {".webm", ".mp4", ".mkv", ".mov", ".avi"}
+
+
+def run_mlx_whisper(audio_path: Path, output_dir: Path, *, model: str, language: str) -> Path:
+    """Run mlx_whisper CLI and return path to the JSON output file."""
+    mlx_bin = shutil.which("mlx_whisper")
+    if mlx_bin:
+        command = [mlx_bin]
+    else:
+        command = [sys.executable, "-m", "mlx_whisper"]
+    command += [
+        "--model",
+        model,
+        "--language",
+        language,
+        "--output-format",
+        "json",
+        "--output-dir",
+        str(output_dir),
+        str(audio_path),
+    ]
+    run_checked(command, label="mlx_whisper transcription")
+    json_output = output_dir / (audio_path.stem + ".json")
+    if not json_output.is_file():
+        candidates = sorted(output_dir.glob("*.json"))
+        if not candidates:
+            raise FileNotFoundError(f"mlx_whisper produced no JSON output in {output_dir}")
+        json_output = candidates[0]
+    return json_output
+
+
+def whisper_json_to_transcript_markdown(whisper_json_path: Path) -> str:
+    """Convert whisper JSON output (with segments) to timestamped transcript markdown.
+
+    Produces clean ``*MM:SS* text`` lines (one per segment) that are directly
+    compatible with the prepare/extraction pipeline.  No speaker labels are
+    emitted because vanilla MLX Whisper has no diarization — adding a fake
+    ``**Speaker 1**`` prefix just confuses downstream normalisation.
+    """
+    payload = load_json(whisper_json_path)
+    segments = payload.get("segments")
+    if not isinstance(segments, list) or not segments:
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            return f"*00:00* {text.strip()}\n"
+        raise ValueError("Whisper JSON contains no segments or text.")
+
+    lines: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        start = segment.get("start", 0)
+        lines.append(f"*{format_mmss(start)}* {text}")
+
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def run_whisperx_diarize(audio_path: Path, output_dir: Path, *, model: str, language: str) -> Path:
+    """Run whisperx with --diarize and return path to the JSON output file."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        "whisperx",
+        str(audio_path),
+        "--model",
+        model,
+        "--language",
+        language,
+        "--diarize",
+        "--output_format",
+        "json",
+        "--output_dir",
+        str(output_dir),
+    ]
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if hf_token:
+        command.extend(["--hf_token", hf_token])
+    run_checked(command, label="whisperx diarization")
+    json_output = output_dir / (audio_path.stem + ".json")
+    if not json_output.is_file():
+        candidates = sorted(output_dir.glob("*.json"))
+        if not candidates:
+            raise FileNotFoundError(f"whisperx produced no JSON output in {output_dir}")
+        json_output = candidates[0]
+    return json_output
+
+
+def whisperx_json_to_transcript_markdown(whisperx_json_path: Path) -> str:
+    """Convert whisperx JSON output (with speaker-labeled segments) to transcript markdown."""
+    payload = load_json(whisperx_json_path)
+    segments = payload.get("segments")
+    if not isinstance(segments, list) or not segments:
+        # Fall back to plain text if available
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            return f"**Speaker 1**: {text.strip()}\n"
+        raise ValueError("WhisperX JSON contains no segments or text.")
+
+    # Build speaker mapping: SPEAKER_00 -> Speaker 1, SPEAKER_01 -> Speaker 2, etc.
+    raw_speakers: set[str] = set()
+    for segment in segments:
+        if isinstance(segment, dict):
+            speaker = segment.get("speaker")
+            if isinstance(speaker, str) and speaker:
+                raw_speakers.add(speaker)
+    sorted_speakers = sorted(raw_speakers)
+    speaker_map: dict[str, str] = {}
+    for idx, raw in enumerate(sorted_speakers):
+        speaker_map[raw] = f"Speaker {idx + 1}"
+
+    lines: list[str] = []
+    prev_speaker: str | None = None
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        start = segment.get("start", 0)
+        raw_speaker = segment.get("speaker")
+        speaker_label = speaker_map.get(str(raw_speaker), "Speaker 1") if raw_speaker else "Speaker 1"
+
+        # Group consecutive segments from the same speaker
+        if speaker_label == prev_speaker and lines and not lines[-1]:
+            # Remove trailing blank line and timestamp to merge with previous block
+            lines.pop()  # remove blank line
+            prev_timestamp = lines.pop() if lines else ""  # remove previous timestamp
+            lines.append(text)
+            lines.append(f"*{format_mmss(start)}*")
+            lines.append("")
+        else:
+            lines.append(f"**{speaker_label}**: {text}")
+            lines.append(f"*{format_mmss(start)}*")
+            lines.append("")
+        prev_speaker = speaker_label
+
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
+
+
+def _extract_audio_from_video(video_path: Path, output_dir: Path) -> Path:
+    """Extract audio from video file as compressed mono mp3."""
+    output_path = output_dir / (video_path.stem + ".mp3")
+    cmd = [
+        "ffmpeg", "-y", "-v", "quiet",
+        "-i", str(video_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except FileNotFoundError:
+        raise ValueError("ffmpeg not found — install ffmpeg to enable video audio extraction") from None
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"ffmpeg failed extracting audio from {video_path}: {(exc.stderr or '').strip()}") from exc
+    print(f"Extracted audio: {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)", file=sys.stderr)
+    return output_path
+
+
+def cmd_audio(args: argparse.Namespace) -> int:
+    source_path = ensure_file(Path(args.path), "Audio/video file")
+    all_supported = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+    if source_path.suffix.lower() not in all_supported:
+        raise ValueError(
+            f"Unsupported format: {source_path.suffix}. "
+            f"Supported: {', '.join(sorted(all_supported))}"
+        )
+    output_root = ensure_parent_dir(Path(args.output_root))
+    title = args.title if getattr(args, "title", None) else source_path.stem
+
+    # Extract audio from video if needed
+    _extracted_tmp_dir = None
+    if source_path.suffix.lower() in VIDEO_EXTENSIONS:
+        _extracted_tmp_dir = tempfile.mkdtemp(prefix="notes-video-extract-")
+        audio_path = _extract_audio_from_video(source_path, Path(_extracted_tmp_dir))
+    else:
+        audio_path = source_path
+    try:
+        return _cmd_audio_inner(args, source_path, audio_path, _extracted_tmp_dir, output_root, title)
+    finally:
+        if _extracted_tmp_dir and os.path.isdir(_extracted_tmp_dir):
+            shutil.rmtree(_extracted_tmp_dir, ignore_errors=True)
+
+
+def _cmd_audio_inner(
+    args: argparse.Namespace,
+    source_path: Path,
+    audio_path: Path,
+    _extracted_tmp_dir: str | None,
+    output_root: Path,
+    title: str,
+) -> int:
+    bundle_dir = local_bundle_dir_for(source_path, title, output_root)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    paths = bundle_paths(bundle_dir)
+
+    # Copy source file
+    source_dir = bundle_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_copy = source_dir / source_path.name
+    if not source_copy.exists() or args.refresh:
+        shutil.copy2(source_path, source_copy)
+
+    is_video = source_path.suffix.lower() in VIDEO_EXTENSIONS
+    write_json(
+        paths["metadata"],
+        {
+            "title": title,
+            "source_path": str(source_path),
+            "source_name": source_path.name,
+            "source_extension": source_path.suffix.lower(),
+            "source_kind": "video" if is_video else "audio",
+            "whisper_model": args.model,
+            "whisper_language": args.language,
+        },
+    )
+
+    transcript_path = paths["transcript"]
+    whisper_json_path = bundle_dir / "whisper_output.json"
+    transcript_source: dict[str, object] | None = None
+
+    use_diarize = getattr(args, "diarize", False)
+
+    use_api_backend = getattr(args, "transcribe_backend", "auto")
+    api_backend: str | None = None
+    if use_api_backend != "auto" or os.environ.get("GROQ_API_KEY") or os.environ.get("ELEVENLABS_API_KEY"):
+        try:
+            api_backend = choose_transcribe_backend(use_api_backend)
+        except ValueError:
+            api_backend = None
+
+    # Check for existing whisper JSON adjacent to the audio file
+    adjacent_json = source_path.with_suffix(".json")
+    if not transcript_path.is_file() and adjacent_json.is_file() and not args.refresh:
+        try:
+            adjacent_data = load_json(adjacent_json)
+            if isinstance(adjacent_data, dict) and "segments" in adjacent_data:
+                print(f"Reusing adjacent whisper JSON: {adjacent_json}", file=sys.stderr)
+                shutil.copy2(adjacent_json, whisper_json_path)
+                raw_markdown = whisper_json_to_transcript_markdown(whisper_json_path)
+                write_text(transcript_path, normalize_transcript_text(raw_markdown))
+                transcript_source = {
+                    "kind": "reused-adjacent-json",
+                    "model": "unknown",
+                    "language": args.language,
+                    "whisper_json": str(whisper_json_path),
+                    "original_json": str(adjacent_json),
+                }
+        except (json.JSONDecodeError, ValueError, KeyError):
+            pass  # Fall through to normal transcription
+
+    if transcript_path.is_file() and not args.refresh:
+        transcript_source = {
+            "kind": "existing",
+            "path": str(transcript_path),
+        }
+    elif api_backend == "groq":
+        raw_json_path = bundle_dir / "groq_output.json"
+        language_hint = normalize_language_hint(args.language) if hasattr(args, "language") else "ru"
+        try:
+            raw_payload = call_groq_transcribe(
+                audio_path, raw_json_path, language=language_hint,
+            )
+            raw_markdown = groq_payload_to_transcript_markdown(raw_payload)
+            write_text(transcript_path, normalize_transcript_text(raw_markdown))
+            transcript_source = {
+                "kind": "groq",
+                "model": "whisper-large-v3-turbo",
+                "language": language_hint or "auto",
+                "raw_json": str(raw_json_path),
+            }
+        except (RateLimitError, ValueError) as exc:
+            if is_macos() and python_module_available("mlx_whisper"):
+                print(f"Groq failed ({exc}), falling back to MLX Whisper...", file=sys.stderr)
+                api_backend = None  # fall through to mlx_whisper block below
+            else:
+                raise ValueError(
+                    f"Groq transcription failed: {exc}. "
+                    f"No local fallback available on this platform. "
+                    f"Check your GROQ_API_KEY and try again."
+                ) from exc
+    elif api_backend == "elevenlabs":
+        raw_json_path = bundle_dir / "elevenlabs_output.json"
+        language_hint = normalize_language_hint(args.language) if hasattr(args, "language") else "ru"
+        raw_payload = call_elevenlabs_transcribe(
+            audio_path, raw_json_path, language=language_hint,
+        )
+        raw_markdown = elevenlabs_payload_to_transcript_markdown(raw_payload)
+        write_text(transcript_path, normalize_transcript_text(raw_markdown))
+        transcript_source = {
+            "kind": "elevenlabs",
+            "model": "scribe_v2",
+            "language": language_hint or "auto",
+            "raw_json": str(raw_json_path),
+        }
+    elif api_backend in ("deepgram", "openai"):
+        raw_json_path = bundle_dir / "api_output.json"
+        language_hint = normalize_language_hint(args.language) if hasattr(args, "language") else "ru"
+        raw_payload = call_transcribe_helper(
+            audio_path, raw_json_path, backend=api_backend, language=language_hint,
+        )
+        raw_markdown = transcript_markdown_from_api_payload(raw_payload)
+        write_text(transcript_path, normalize_transcript_text(raw_markdown))
+        transcript_source = {
+            "kind": "api",
+            "backend": api_backend,
+            "language": language_hint or "auto",
+            "raw_json": str(raw_json_path),
+        }
+    elif use_diarize and shutil.which("whisperx"):
+        ensure_audio_transcription_available("Audio transcription")
+        with tempfile.TemporaryDirectory(prefix="notes-whisperx-") as tmp_dir:
+            tmp_output = Path(tmp_dir)
+            whisper_output = run_whisperx_diarize(
+                audio_path, tmp_output, model=args.model, language=args.language,
+            )
+            shutil.copy2(whisper_output, whisper_json_path)
+
+        raw_markdown = whisperx_json_to_transcript_markdown(whisper_json_path)
+        write_text(transcript_path, normalize_transcript_text(raw_markdown))
+        transcript_source = {
+            "kind": "whisperx_diarize",
+            "model": args.model,
+            "language": args.language,
+            "whisper_json": str(whisper_json_path),
+        }
+
+    # Fallback: MLX Whisper (also catches Groq/ElevenLabs failures above) — macOS only
+    if transcript_source is None:
+        if not is_macos():
+            raise FileNotFoundError(
+                "No transcription backend succeeded. "
+                "Set GROQ_API_KEY (free at console.groq.com) or ELEVENLABS_API_KEY to transcribe audio on this platform."
+            )
+        ensure_audio_transcription_available("Audio transcription")
+        if use_diarize:
+            print("Warning: --diarize requested but whisperx is not installed. Falling back to mlx_whisper.", file=sys.stderr)
+        with tempfile.TemporaryDirectory(prefix="notes-whisper-") as tmp_dir:
+            tmp_output = Path(tmp_dir)
+            whisper_output = run_mlx_whisper(
+                audio_path, tmp_output, model=args.model, language=args.language,
+            )
+            shutil.copy2(whisper_output, whisper_json_path)
+
+        raw_markdown = whisper_json_to_transcript_markdown(whisper_json_path)
+        write_text(transcript_path, normalize_transcript_text(raw_markdown))
+        transcript_source = {
+            "kind": "mlx_whisper",
+            "model": args.model,
+            "language": args.language,
+            "whisper_json": str(whisper_json_path),
+        }
+
+    payload: dict[str, object] = {
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "source_kind": "video" if is_video else "audio",
+        "source_path": str(source_path),
+        "source_name": source_path.name,
+        "source_copy_path": str(source_copy),
+        "title_hint": source_path.stem,
+        "metadata_path": str(paths["metadata"]),
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+        "suggested_output_md": str(paths["notes_md"]),
+        "suggested_output_html": str(paths["notes_html"]),
+    }
+
+    if args.prepare:
+        prepare_payload = run_prepare_for_transcript(transcript_path)
+        work_dir = ensure_dir(Path(prepare_payload["work_dir"]), "Work directory")
+        work_link = link_bundle_work_dir(bundle_dir, work_dir)
+        payload["prepare"] = prepare_payload
+        payload["work_link"] = str(work_link)
+
+    state_payload = {
+        "updated_at": datetime.now().isoformat(),
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "source_kind": "video" if is_video else "audio",
+        "source_path": str(source_path),
+        "source_name": source_path.name,
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+        "whisper_model": args.model,
+        "whisper_language": args.language,
+    }
+    if "prepare" in payload:
+        state_payload["prepare"] = payload["prepare"]
+    write_json(paths["state"], state_payload)
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Bundle: {bundle_dir}")
+    print(f"Title: {title}")
+    print(f"Source: {audio_path}")
+    print(f"Transcript: {transcript_path}")
+    print(f"Suggested markdown: {paths['notes_md']}")
+    print(f"Suggested HTML: {paths['notes_html']}")
+    if args.prepare and "prepare" in payload:
+        print(f"Work dir: {payload['prepare']['work_dir']}")
+    return 0
+
+
+def download_telegram_media(chat: str, message_id: int, mcp_url: str) -> Path:
+    """Download media from a Telegram message via MCP JSON-RPC and return the local file path."""
+    request_body = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "download_media",
+            "arguments": {"chat": chat, "message_id": message_id},
+        },
+        "id": 1,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        mcp_url,
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            response_data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Failed to connect to Telegram MCP at {mcp_url}: {exc}") from exc
+
+    if "error" in response_data:
+        error = response_data["error"]
+        msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        raise ValueError(f"Telegram MCP error: {msg}")
+
+    result = response_data.get("result")
+    if not result:
+        raise ValueError(f"Telegram MCP returned no result: {response_data}")
+
+    # MCP tools/call result has "content" array with text entries
+    content = result.get("content") if isinstance(result, dict) else None
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item["text"]
+                # Try to parse as JSON (download_media returns JSON with file path)
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        file_path = parsed.get("path") or parsed.get("file_path") or parsed.get("file")
+                        if file_path:
+                            path = Path(str(file_path))
+                            if path.is_file():
+                                return path
+                except json.JSONDecodeError:
+                    pass
+                # Maybe the text itself is a file path
+                candidate = Path(text.strip())
+                if candidate.is_file():
+                    return candidate
+
+    # Fallback: check if result itself contains a path
+    if isinstance(result, dict):
+        for key in ("path", "file_path", "file"):
+            value = result.get(key)
+            if isinstance(value, str) and Path(value).is_file():
+                return Path(value)
+
+    raise ValueError(f"Could not extract file path from MCP response: {response_data}")
+
+
+def cmd_telegram(args: argparse.Namespace) -> int:
+    """Download a Telegram voice/audio message and create a notes bundle."""
+    output_root = ensure_parent_dir(Path(args.output_root))
+
+    # Step 1: Download media from Telegram
+    media_path = download_telegram_media(args.chat, args.message_id, args.mcp_url)
+
+    if media_path.suffix.lower() not in AUDIO_EXTENSIONS:
+        raise ValueError(
+            f"Downloaded file is not a supported audio format: {media_path.suffix} ({media_path}). "
+            f"Supported: {', '.join(sorted(AUDIO_EXTENSIONS))}"
+        )
+
+    # Step 2: Delegate to the same logic as cmd_audio
+    title = f"telegram-{args.chat}-{args.message_id}"
+    bundle_dir = local_bundle_dir_for(media_path, title, output_root)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    paths = bundle_paths(bundle_dir)
+
+    # Copy source audio
+    source_dir = bundle_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_copy = source_dir / media_path.name
+    shutil.copy2(media_path, source_copy)
+
+    write_json(
+        paths["metadata"],
+        {
+            "title": title,
+            "source_path": str(media_path),
+            "source_name": media_path.name,
+            "source_extension": media_path.suffix.lower(),
+            "source_kind": "telegram",
+            "telegram_chat": args.chat,
+            "telegram_message_id": args.message_id,
+            "whisper_model": args.model,
+            "whisper_language": args.language,
+        },
+    )
+
+    transcript_path = paths["transcript"]
+    whisper_json_path = bundle_dir / "whisper_output.json"
+    use_diarize = getattr(args, "diarize", False)
+
+    if use_diarize and shutil.which("whisperx"):
+        ensure_audio_transcription_available("Telegram voice notes")
+        with tempfile.TemporaryDirectory(prefix="notes-whisperx-") as tmp_dir:
+            tmp_output = Path(tmp_dir)
+            whisper_output = run_whisperx_diarize(
+                media_path, tmp_output, model=args.model, language=args.language,
+            )
+            shutil.copy2(whisper_output, whisper_json_path)
+
+        raw_markdown = whisperx_json_to_transcript_markdown(whisper_json_path)
+        write_text(transcript_path, normalize_transcript_text(raw_markdown))
+        transcript_source: dict[str, object] = {
+            "kind": "telegram-voice-diarize",
+            "chat": args.chat,
+            "message_id": args.message_id,
+            "model": args.model,
+            "language": args.language,
+            "whisper_json": str(whisper_json_path),
+            "downloaded_path": str(media_path),
+        }
+    else:
+        # Try API backends first (cross-platform), then MLX Whisper (macOS only)
+        api_backend = None
+        try:
+            api_backend = choose_transcribe_backend(getattr(args, "transcribe_backend", "auto"))
+        except ValueError:
+            pass  # No API key available, try local
+
+        if api_backend == "groq":
+            raw_json_path = bundle_dir / "groq_output.json"
+            language_hint = normalize_language_hint(args.language) if hasattr(args, "language") else "ru"
+            raw_payload = call_groq_transcribe(media_path, raw_json_path, language=language_hint)
+            raw_markdown = groq_payload_to_transcript_markdown(raw_payload)
+            write_text(transcript_path, normalize_transcript_text(raw_markdown))
+            transcript_source: dict[str, object] = {
+                "kind": "telegram-voice-groq",
+                "chat": args.chat,
+                "message_id": args.message_id,
+                "model": "whisper-large-v3-turbo",
+                "language": language_hint or "auto",
+                "raw_json": str(raw_json_path),
+                "downloaded_path": str(media_path),
+            }
+        elif api_backend == "elevenlabs":
+            raw_json_path = bundle_dir / "elevenlabs_output.json"
+            language_hint = normalize_language_hint(args.language) if hasattr(args, "language") else "ru"
+            raw_payload = call_elevenlabs_transcribe(media_path, raw_json_path, language=language_hint)
+            raw_markdown = elevenlabs_payload_to_transcript_markdown(raw_payload)
+            write_text(transcript_path, normalize_transcript_text(raw_markdown))
+            transcript_source: dict[str, object] = {
+                "kind": "telegram-voice-elevenlabs",
+                "chat": args.chat,
+                "message_id": args.message_id,
+                "model": "scribe_v2",
+                "language": language_hint or "auto",
+                "raw_json": str(raw_json_path),
+                "downloaded_path": str(media_path),
+            }
+        elif is_macos():
+            ensure_audio_transcription_available("Telegram voice notes")
+            if use_diarize:
+                print("Warning: --diarize requested but whisperx is not installed. Falling back to mlx_whisper.", file=sys.stderr)
+            with tempfile.TemporaryDirectory(prefix="notes-whisper-") as tmp_dir:
+                tmp_output = Path(tmp_dir)
+                whisper_output = run_mlx_whisper(
+                    media_path, tmp_output, model=args.model, language=args.language,
+                )
+                shutil.copy2(whisper_output, whisper_json_path)
+
+            raw_markdown = whisper_json_to_transcript_markdown(whisper_json_path)
+            write_text(transcript_path, normalize_transcript_text(raw_markdown))
+            transcript_source: dict[str, object] = {
+                "kind": "telegram-voice",
+                "chat": args.chat,
+                "message_id": args.message_id,
+                "model": args.model,
+                "language": args.language,
+                "whisper_json": str(whisper_json_path),
+                "downloaded_path": str(media_path),
+            }
+        else:
+            raise FileNotFoundError(
+                "No transcription backend available. "
+                "Set GROQ_API_KEY (free at console.groq.com) or ELEVENLABS_API_KEY."
+            )
+
+    payload: dict[str, object] = {
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "source_kind": "telegram",
+        "source_path": str(media_path),
+        "source_name": media_path.name,
+        "source_copy_path": str(source_copy),
+        "metadata_path": str(paths["metadata"]),
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+        "suggested_output_md": str(paths["notes_md"]),
+        "suggested_output_html": str(paths["notes_html"]),
+        "telegram_chat": args.chat,
+        "telegram_message_id": args.message_id,
+    }
+
+    if args.prepare:
+        prepare_payload = run_prepare_for_transcript(transcript_path)
+        work_dir = ensure_dir(Path(prepare_payload["work_dir"]), "Work directory")
+        work_link = link_bundle_work_dir(bundle_dir, work_dir)
+        payload["prepare"] = prepare_payload
+        payload["work_link"] = str(work_link)
+
+    state_payload = {
+        "updated_at": datetime.now().isoformat(),
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "source_kind": "telegram",
+        "source_path": str(media_path),
+        "source_name": media_path.name,
+        "telegram_chat": args.chat,
+        "telegram_message_id": args.message_id,
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+        "whisper_model": args.model,
+        "whisper_language": args.language,
+    }
+    if "prepare" in payload:
+        state_payload["prepare"] = payload["prepare"]
+    write_json(paths["state"], state_payload)
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Bundle: {bundle_dir}")
+    print(f"Title: {title}")
+    print(f"Source: {media_path}")
+    print(f"Transcript: {transcript_path}")
+    print(f"Suggested markdown: {paths['notes_md']}")
+    print(f"Suggested HTML: {paths['notes_html']}")
+    if args.prepare and "prepare" in payload:
+        print(f"Work dir: {payload['prepare']['work_dir']}")
+    return 0
+
+
+def is_youtube_url(value: str) -> bool:
+    """Check if a string looks like a YouTube URL."""
+    return "youtube.com/" in value or "youtu.be/" in value
+
+
+def cmd_auto(args: argparse.Namespace) -> int:
+    """Auto-detect input type and route to the appropriate command."""
+    input_value = args.input
+
+    if is_youtube_url(input_value):
+        # Route to youtube
+        args.url = input_value
+        args.command = "youtube"
+        if not hasattr(args, "refresh"):
+            args.refresh = False
+        if not hasattr(args, "transcribe_backend"):
+            args.transcribe_backend = "auto"
+        # Normalize language: audio default "auto" matches youtube default
+        return cmd_youtube(args)
+
+    # It's a file path
+    file_path = Path(input_value).expanduser().resolve()
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Input file not found: {file_path}")
+
+    if file_path.suffix.lower() in AUDIO_EXTENSIONS:
+        # Route to audio
+        args.path = str(file_path)
+        args.command = "audio"
+        if not hasattr(args, "refresh"):
+            args.refresh = False
+        # For audio, language default should be "ru" if left at "auto"
+        if args.language == "auto":
+            args.language = "ru"
+        return cmd_audio(args)
+
+    # Default: treat as local text/markdown file
+    args.path = str(file_path)
+    args.command = "local"
+    if not hasattr(args, "refresh"):
+        args.refresh = False
+    return cmd_local(args)
+
+
+def cmd_youtube(args: argparse.Namespace) -> int:
+    output_root = ensure_parent_dir(Path(args.output_root))
+    metadata = extract_youtube_metadata(args.url)
+    bundle_dir = bundle_dir_for(metadata, output_root)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    paths = bundle_paths(bundle_dir)
+    paths["subs_dir"].mkdir(parents=True, exist_ok=True)
+    paths["audio_dir"].mkdir(parents=True, exist_ok=True)
+
+    write_json(paths["metadata"], metadata)
+    write_text(paths["source_url"], args.url + "\n")
+
+    chapters = extract_youtube_chapters(metadata)
+    chapters_path = bundle_dir / "chapters.json"
+    if chapters:
+        write_json(chapters_path, {"chapters": chapters})
+
+    duration_seconds = metadata.get("duration")
+    duration_value = int(duration_seconds) if isinstance(duration_seconds, (int, float)) else None
+    transcript_source: dict[str, object]
+    audio_path: Path | None = None
+    transcript_path = paths["transcript"]
+    warnings: list[str] = []
+
+    if transcript_path.is_file() and not args.refresh:
+        transcript_source = {
+            "kind": "existing",
+            "path": str(transcript_path),
+        }
+    else:
+        # Fast path: try youtube-transcript-api first (no audio download, ~2s)
+        video_id = str(metadata.get("id") or "").strip()
+        api_cues, api_language, api_error = ([], None, "no video_id")
+        if video_id:
+            api_cues, api_language, api_error = try_youtube_transcript_api(video_id, duration_value)
+
+        if api_cues and api_error is None:
+            write_text(transcript_path, transcript_markdown_from_cues(api_cues))
+            transcript_source = {
+                "kind": "youtube-transcript-api",
+                "language": api_language,
+            }
+        else:
+            # Fallback: yt-dlp subtitles
+            if api_error:
+                warnings.append(f"youtube-transcript-api: {api_error}")
+            subtitle_path, cues, subtitle_language = select_best_subtitle(paths["subs_dir"], duration_value)
+            if subtitle_path is None or args.refresh:
+                subtitle_error = download_subtitles(args.url, paths["subs_dir"])
+                if subtitle_error:
+                    warnings.append(subtitle_error)
+                subtitle_path, cues, subtitle_language = select_best_subtitle(paths["subs_dir"], duration_value)
+
+            if subtitle_path is not None and cues:
+                write_text(transcript_path, transcript_markdown_from_cues(cues))
+                transcript_source = {
+                    "kind": "subtitles",
+                    "path": str(subtitle_path),
+                    "language": subtitle_language,
+                }
+            else:
+                try:
+                    backend = choose_transcribe_backend(args.transcribe_backend)
+                    language_hint = normalize_language_hint(args.language)
+                    if not language_hint and subtitle_language in {"en", "ru"}:
+                        language_hint = subtitle_language
+                    audio_matches = sorted(paths["audio_dir"].glob("source.*"))
+                    audio_path = audio_matches[0] if audio_matches and not args.refresh else None
+                    if audio_path is None:
+                        audio_path = download_audio(args.url, paths["audio_dir"])
+                    if backend == "groq":
+                        raw_payload = call_groq_transcribe(
+                            audio_path, paths["raw_transcript"], language=language_hint,
+                        )
+                    elif backend == "elevenlabs":
+                        raw_payload = call_elevenlabs_transcribe(
+                            audio_path, paths["raw_transcript"], language=language_hint,
+                        )
+                    else:
+                        raise ValueError(f"Unsupported transcription backend: {backend}")
+                except FileNotFoundError as exc:
+                    raise FileNotFoundError(
+                        advanced_setup_message(
+                            "YouTube transcription fallback",
+                            "Starter mode only supports videos with subtitles/autosubs. To process subtitle-free videos, configure NOTES_RUNNER_TRANSCRIBE_CLI and a transcription backend",
+                        )
+                    ) from exc
+                except ValueError as exc:
+                    if "No transcription API key available" in str(exc):
+                        raise ValueError(
+                            advanced_setup_message(
+                                "YouTube transcription fallback",
+                                "Set OPENAI_API_KEY or DEEPGRAM_API_KEY to use API transcription when subtitles are missing",
+                            )
+                        ) from exc
+                    raise
+                if backend == "groq":
+                    write_text(transcript_path, groq_payload_to_transcript_markdown(raw_payload))
+                elif backend == "elevenlabs":
+                    write_text(transcript_path, elevenlabs_payload_to_transcript_markdown(raw_payload))
+                else:
+                    raise ValueError(f"Unsupported transcription backend: {backend}")
+                transcript_source = {
+                    "kind": "api",
+                    "backend": backend,
+                    "model": {"groq": "whisper-large-v3-turbo", "elevenlabs": "scribe_v2"}.get(backend, backend),
+                    "path": str(paths["raw_transcript"]),
+                    "language": language_hint or "auto",
+                }
+
+    title = str(metadata.get("title") or metadata.get("id") or "YouTube notes")
+    payload: dict[str, object] = {
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "video_id": metadata.get("id"),
+        "source_url": args.url,
+        "metadata_path": str(paths["metadata"]),
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+        "audio_path": str(audio_path) if audio_path else None,
+        "suggested_output_md": str(paths["notes_md"]),
+        "suggested_output_html": str(paths["notes_html"]),
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    if chapters:
+        payload["chapters"] = chapters
+        payload["chapters_path"] = str(chapters_path)
+
+    if args.prepare:
+        prepare_payload = run_prepare_for_transcript(transcript_path)
+        work_dir = ensure_dir(Path(prepare_payload["work_dir"]), "Work directory")
+        work_link = link_bundle_work_dir(bundle_dir, work_dir)
+        payload["prepare"] = prepare_payload
+        payload["work_link"] = str(work_link)
+
+    state_payload = {
+        "updated_at": datetime.now().isoformat(),
+        "bundle_dir": str(bundle_dir),
+        "title": title,
+        "video_id": metadata.get("id"),
+        "source_kind": "youtube",
+        "source_url": args.url,
+        "transcript_path": str(transcript_path),
+        "transcript_source": transcript_source,
+        "audio_path": str(audio_path) if audio_path else None,
+    }
+    if warnings:
+        state_payload["warnings"] = warnings
+    if chapters:
+        state_payload["chapters_count"] = len(chapters)
+    if "prepare" in payload:
+        state_payload["prepare"] = payload["prepare"]
+    write_json(paths["state"], state_payload)
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Bundle: {bundle_dir}")
+    print(f"Title: {title}")
+    print(f"Transcript: {transcript_path}")
+    print(f"Transcript source: {transcript_source}")
+    print(f"Suggested markdown: {paths['notes_md']}")
+    print(f"Suggested HTML: {paths['notes_html']}")
+    if args.prepare and "prepare" in payload:
+        print(f"Work dir: {payload['prepare']['work_dir']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Prepare logic (extracted from prepare.sh heredoc)
+# ---------------------------------------------------------------------------
+
+SPEAKER_MARKER_RE = re.compile(r"\*\*Speaker\s+(\d+)\*\*")
+DIALOGUE_PREFIX_RE = re.compile(r"^\s*(?:[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 .,_\-]{0,40})\s*:")
+INTRO_RE = re.compile(
+    r"(меня зовут|мне зовут|расскажи про себя|расскажите про себя|представь(?:ся| себя)?|"
+    r"я .*кодер|я .*предприниматель|я .*разработчик|кто ты такой|кто вы такой)",
+    re.IGNORECASE,
+)
+TIME_RE = re.compile(r"\*([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)\*")
+SPEAKER_CLUE_RE = re.compile(
+    r"(меня зовут|мне зовут|я —|привет,?\s*я\b|расскажи про себя|расскажите про себя|представь(?:ся| себя)?|"
+    r"у нас в гостях|сегодня с нами|в гостях у нас|спасибо,?\s+\w|"
+    r"Speaker\s+\d+|^\s*[\wА-Яа-я][^:\n]{0,60}:)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class FileMeta:
+    path: Path
+    lines: int
+    bytes: int
+    mtime: float
+    markers: int
+    dialogue_cues: int
+    intro_cues: int
+    clues: list[str]
+    duration_estimate: str | None
+
+
+def _prepare_read_lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
+def _prepare_short_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _prepare_chunk_label(index: int) -> str:
+    n = index
+    label = ""
+    while True:
+        n, rem = divmod(n, 26)
+        label = chr(ord("A") + rem) + label
+        if n == 0:
+            return label
+        n -= 1
+
+
+def _prepare_last_timestamp(lines: list[str]) -> str | None:
+    timestamps = TIME_RE.findall("\n".join(lines))
+    return timestamps[-1] if timestamps else None
+
+
+def _parse_duration_to_seconds(duration_str: str | None) -> int:
+    """Parse a duration string like '01:23:45' or '23:45' to total seconds."""
+    if not duration_str:
+        return 0
+    parts = duration_str.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+    except ValueError:
+        pass
+    return 0
+
+
+def _prepare_detect_file_meta(path: Path) -> FileMeta:
+    lines = _prepare_read_lines(path)
+    joined = "\n".join(lines)
+    marker_matches = SPEAKER_MARKER_RE.findall(joined)
+    dialogue_cues = sum(1 for line in lines if DIALOGUE_PREFIX_RE.match(line))
+    intro_cues = sum(1 for line in lines if INTRO_RE.search(line))
+    clues: list[str] = []
+    for idx, line in enumerate(lines, start=1):
+        if SPEAKER_CLUE_RE.search(line):
+            context_lines = []
+            for ctx_idx in range(max(0, idx - 3), min(len(lines), idx + 2)):
+                prefix = ">>>" if ctx_idx == idx - 1 else "   "
+                context_lines.append(f"{prefix} {ctx_idx + 1}: {lines[ctx_idx].strip()}")
+            clues.append("\n".join(context_lines))
+            if len(clues) >= 15:
+                break
+    stat = path.stat()
+    return FileMeta(
+        path=path,
+        lines=len(lines),
+        bytes=stat.st_size,
+        mtime=stat.st_mtime,
+        markers=len(set(marker_matches)),
+        dialogue_cues=dialogue_cues,
+        intro_cues=intro_cues,
+        clues=clues,
+        duration_estimate=_prepare_last_timestamp(lines),
+    )
+
+
+def _prepare_classify_speaker_stage(files: list[FileMeta]) -> tuple[str, str]:
+    total_markers = sum(item.markers for item in files)
+    total_dialogue = sum(item.dialogue_cues for item in files)
+    total_intro = sum(item.intro_cues for item in files)
+    total_lines = sum(item.lines for item in files)
+
+    if total_markers >= 2 or total_dialogue >= 4 or total_intro >= 2:
+        return "required", "multiple speaker markers or dialog cues detected"
+    if total_markers <= 1 and total_dialogue <= 1 and total_intro == 0 and total_lines < 1200:
+        return "skip", "single-speaker or lecture-style transcript with weak dialog cues"
+    return "optional", "speaker identification may help, but content can be processed safely without it"
+
+
+def _prepare_choose_prescan_limit(speaker_stage: str) -> int:
+    return 40 if speaker_stage == "skip" else 200
+
+
+def _prepare_is_quick_mode(total_lines: int) -> bool:
+    """Quick mode for very short recordings (under ~7 min / 250 lines)."""
+    return total_lines < 250
+
+
+def _prepare_chunk_count_for(lines: int, speaker_stage: str, *, duration_seconds: int = 0) -> int:
+    if _prepare_is_quick_mode(lines):
+        return 1
+
+    # If we have actual duration, use it for smarter splitting
+    if duration_seconds > 0:
+        # Target ~15 min per chunk for faster parallel extraction
+        target_chunk_minutes = 15
+        chunks_by_duration = max(1, math.ceil(duration_seconds / 60 / target_chunk_minutes))
+        # Still respect line-based limits
+        max_chunks = 12 if lines >= 12000 else 10 if lines >= 8000 else 8
+        return min(chunks_by_duration, max_chunks)
+
+    if lines < 350 and speaker_stage == "skip":
+        return 1
+
+    speaker_factor = {
+        "required": 0.92,
+        "optional": 1.0,
+        "skip": 1.16,
+    }[speaker_stage]
+    target_lines = max(350.0, (500.0 + lines / 12.0) * speaker_factor)
+    chunks = max(1, math.ceil(lines / target_lines))
+
+    if lines >= 500:
+        chunks = max(2, chunks)
+    elif chunks == 0:
+        chunks = 1
+
+    max_chunks = 12 if lines >= 12000 else 10 if lines >= 8000 else 8
+    return min(chunks, max_chunks)
+
+
+def _prepare_build_chunk_plan(meta: list[FileMeta], speaker_stage: str) -> list[dict]:
+    plan: list[dict] = []
+    global_index = 0
+    for file_meta in meta:
+        lines = file_meta.lines
+        duration_seconds = _parse_duration_to_seconds(file_meta.duration_estimate)
+        chunks = _prepare_chunk_count_for(lines, speaker_stage, duration_seconds=duration_seconds)
+        chunk_size = math.ceil(lines / chunks)
+        overlap = max(10, min(24, round(chunk_size * 0.08)))
+
+        for chunk_index in range(chunks):
+            start = chunk_index * chunk_size + 1
+            end = min(lines, (chunk_index + 1) * chunk_size)
+            if chunk_index == chunks - 1:
+                end = lines
+
+            if chunk_index == 0 and global_index == 0:
+                context_start = None
+                context_end = None
+                read_start = start
+            else:
+                context_start = max(1, start - overlap)
+                context_end = max(1, start - 1)
+                read_start = context_start
+
+            plan.append(
+                {
+                    "chunk_id": _prepare_chunk_label(global_index),
+                    "file": str(file_meta.path),
+                    "context_start": context_start,
+                    "context_end": context_end,
+                    "extraction_start": start,
+                    "extraction_end": end,
+                    "read_start": read_start,
+                    "read_end": end,
+                    "chunk_size": chunk_size,
+                    "overlap": overlap,
+                    "target_lines": max(650, int(round((1000.0 + lines / 12.0) * {
+                        "required": 0.92,
+                        "optional": 1.0,
+                        "skip": 1.16,
+                    }[speaker_stage]))),
+                }
+            )
+            global_index += 1
+    return plan
+
+
+def _prepare_build_prescan_context(meta: list[FileMeta], speaker_stage: str, prescan_limit: int) -> str:
+    TAIL_LINES = 100
+    parts: list[str] = []
+    for item in meta:
+        file_stem = item.path.stem
+        parts.append(f"=== FILE NAME HINT: \"{file_stem}\" ===")
+        parts.append("(The file is usually named after the main speaker/guest. Use this as primary identification hint.)")
+        parts.append("")
+
+        all_lines = _prepare_read_lines(item.path)
+        head_lines = all_lines[:prescan_limit]
+        parts.append(f"=== FILE: {item.path} (first {prescan_limit} lines) ===")
+        parts.extend(head_lines)
+        parts.append("")
+
+        if len(all_lines) > prescan_limit + TAIL_LINES:
+            tail_lines = all_lines[-TAIL_LINES:]
+            tail_start = len(all_lines) - TAIL_LINES + 1
+            parts.append(f"=== LAST {TAIL_LINES} LINES (from line {tail_start}): {item.path} ===")
+            parts.extend(tail_lines)
+            parts.append("")
+
+        MID_SAMPLE = 50
+        if len(all_lines) > prescan_limit + TAIL_LINES + MID_SAMPLE:
+            mid_start = prescan_limit
+            mid_end = len(all_lines) - TAIL_LINES
+            if mid_end - mid_start > MID_SAMPLE:
+                best_score = -1
+                best_offset = mid_start
+                window_step = max(1, (mid_end - mid_start - MID_SAMPLE) // 20)
+                for offset in range(mid_start, mid_end - MID_SAMPLE, window_step):
+                    window = all_lines[offset:offset + MID_SAMPLE]
+                    score = sum(1 for ln in window if SPEAKER_CLUE_RE.search(ln))
+                    markers_in_window = set(SPEAKER_MARKER_RE.findall("\n".join(window)))
+                    score += len(markers_in_window) * 2
+                    if score > best_score:
+                        best_score = score
+                        best_offset = offset
+                mid_lines = all_lines[best_offset:best_offset + MID_SAMPLE]
+                parts.append(f"=== MIDDLE SAMPLE (lines {best_offset + 1}-{best_offset + MID_SAMPLE}, densest speaker activity): {item.path} ===")
+                parts.extend(mid_lines)
+                parts.append("")
+
+        parts.append(f"=== SPEAKER HINTS FROM FULL FILE: {item.path} ===")
+        if speaker_stage == "skip":
+            parts.append("Speaker stage can be skipped for this file.")
+        else:
+            if item.clues:
+                parts.extend(item.clues)
+            else:
+                parts.append("No strong speaker clues found in the sampled text.")
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def _prepare_build_report(
+    *,
+    work_dir: Path,
+    fingerprint: str,
+    meta: list[FileMeta],
+    speaker_stage: str,
+    speaker_reason: str,
+    prescan_limit: int,
+    plan: list[dict],
+) -> str:
+    total_lines = sum(item.lines for item in meta)
+    total_chunks = len(plan)
+    duration_estimate = next((item.duration_estimate for item in reversed(meta) if item.duration_estimate), "unknown")
+    speaker_markers = sorted(
+        {f"Speaker {marker}" for item in meta for marker in SPEAKER_MARKER_RE.findall("\n".join(_prepare_read_lines(item.path)))}
+    )
+
+    lines: list[str] = [
+        "=== NOTES PREPARATION REPORT ===",
+        f"WORK_DIR: {work_dir}",
+        f"Fingerprint: {fingerprint}",
+        f"Files: {len(meta)}",
+        f"Total lines: {total_lines}",
+        f"Duration estimate: {duration_estimate}",
+        f"Unique speakers: {len(speaker_markers)}",
+        f"Speaker stage: {speaker_stage} ({speaker_reason})",
+        f"Prescan limit: {prescan_limit} lines",
+    ]
+    if speaker_markers:
+        lines.append(f"Speaker markers: {', '.join(speaker_markers)}")
+    lines.extend(
+        [
+            "",
+            "=== CHUNK ASSIGNMENTS ===",
+            "",
+        ]
+    )
+
+    current_file = None
+    for chunk in plan:
+        if chunk["file"] != current_file:
+            current_file = chunk["file"]
+            file_meta = next(item for item in meta if str(item.path) == current_file)
+            lines.append(f"FILE: {current_file} ({file_meta.lines} lines, {_prepare_chunk_count_for(file_meta.lines, speaker_stage)} chunks)")
+            lines.append("")
+
+        lines.append(f"  CHUNK {chunk['chunk_id']}:")
+        lines.append(f"    file: {chunk['file']}")
+        if chunk["context_start"] is None:
+            lines.append("    context_zone: none (first chunk)")
+        else:
+            lines.append(f"    context_zone: lines {chunk['context_start']} to {chunk['context_end']}")
+        lines.append(f"    extraction_zone: lines {chunk['extraction_start']} to {chunk['extraction_end']}")
+        lines.append(f"    read_range: lines {chunk['read_start']} to {chunk['read_end']}")
+        lines.append(f"    target_lines: {chunk['target_lines']}")
+        lines.append(f"    overlap: {chunk['overlap']}")
+        lines.append("")
+
+    lines.extend(
+        [
+            f"=== TOTAL CHUNKS: {total_chunks} ===",
+            "",
+            f"prepare_plan.json: {work_dir / 'prepare_plan.json'}",
+            f"prepare_state.json: {work_dir / 'prepare_state.json'}",
+            f"prescan_context.txt: {work_dir / 'prescan_context.txt'}",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _prepare_dump_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def run_prepare_logic(input_files: list[Path]) -> dict:
+    """Run the full prepare analysis and return a summary dict.
+
+    Creates a work_dir in /tmp/, writes all artifacts (state, plan, report,
+    prescan_context), and returns a dict with work_dir, fingerprint,
+    speaker_stage, etc.
+    """
+    resolved = [p.expanduser().resolve() for p in input_files]
+    if not resolved:
+        raise ValueError("No input files provided")
+
+    meta = [_prepare_detect_file_meta(path) for path in resolved]
+    fingerprint_source = "\n".join(
+        f"{item.path}|{item.lines}|{item.bytes}|{int(item.mtime)}" for item in meta
+    )
+    fingerprint = _prepare_short_hash(fingerprint_source)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    work_dir = Path(f"/tmp/notes_{timestamp}_{fingerprint}")
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    speaker_stage, speaker_reason = _prepare_classify_speaker_stage(meta)
+    prescan_limit = _prepare_choose_prescan_limit(speaker_stage)
+    plan = _prepare_build_chunk_plan(meta, speaker_stage)
+    prescan_context = _prepare_build_prescan_context(meta, speaker_stage, prescan_limit)
+    report = _prepare_build_report(
+        work_dir=work_dir,
+        fingerprint=fingerprint,
+        meta=meta,
+        speaker_stage=speaker_stage,
+        speaker_reason=speaker_reason,
+        prescan_limit=prescan_limit,
+        plan=plan,
+    )
+
+    total_lines = sum(item.lines for item in meta)
+    quick_mode = _prepare_is_quick_mode(total_lines)
+
+    state_payload = {
+        "schema_version": 1,
+        "work_dir": str(work_dir),
+        "created_at": timestamp,
+        "fingerprint": fingerprint,
+        "quick_mode": quick_mode,
+        "total_lines": total_lines,
+        "total_chunks": len(plan),
+        "unique_speakers": sum(item.markers for item in meta),
+        "duration_estimate": next((item.duration_estimate for item in reversed(meta) if item.duration_estimate), "unknown"),
+        "speaker_stage": speaker_stage,
+        "speaker_stage_reason": speaker_reason,
+        "speaker_stage_skippable": speaker_stage == "skip",
+        "prescan_limit": prescan_limit,
+        "stage_hints": {
+            "speaker_identification": speaker_stage,
+            "appendix": "deterministic-fallback",
+        },
+        "stage_statuses": {
+            "speaker_identification": "skipped" if speaker_stage == "skip" else "missing",
+            "extraction": "missing",
+            "tldr": "missing",
+            "assemble": "missing",
+        },
+        "files": [
+            {
+                "path": str(item.path),
+                "lines": item.lines,
+                "bytes": item.bytes,
+                "mtime": item.mtime,
+                "markers": item.markers,
+                "dialogue_cues": item.dialogue_cues,
+                "intro_cues": item.intro_cues,
+                "duration_estimate": item.duration_estimate,
+            }
+            for item in meta
+        ],
+        "totals": {
+            "files": len(meta),
+            "lines": sum(item.lines for item in meta),
+            "chunks": len(plan),
+            "speaker_markers": sum(item.markers for item in meta),
+        },
+        "artifacts": {
+            "report": str(work_dir / "prepare_report.txt"),
+            "plan": str(work_dir / "prepare_plan.json"),
+            "state": str(work_dir / "prepare_state.json"),
+            "prescan_context": str(work_dir / "prescan_context.txt"),
+        },
+        "chunk_plan": plan,
+    }
+
+    plan_payload: dict = {
+        "schema_version": 1,
+        "work_dir": str(work_dir),
+        "fingerprint": fingerprint,
+        "quick_mode": quick_mode,
+        "speaker_stage": speaker_stage,
+        "speaker_stage_reason": speaker_reason,
+        "chunking": {
+            "strategy": "single-chunk" if quick_mode else "adaptive-line-budget",
+            "prescan_limit": prescan_limit,
+        },
+        "chunks": plan,
+    }
+
+    plan_payload["chunking"]["max_chunks"] = max(
+        [_prepare_chunk_count_for(item.lines, speaker_stage) for item in meta] or [0]
+    )
+    plan_payload["chunking"]["total_chunks"] = len(plan)
+
+    # --- Append chapter markers to prescan context if available ---
+    chapters_loaded: list[dict] = []
+    for item in meta:
+        chapters_path = item.path.parent / "chapters.json"
+        if chapters_path.is_file():
+            try:
+                chapters_data = json.loads(chapters_path.read_text(encoding="utf-8"))
+                chapters_loaded = chapters_data.get("chapters", [])
+            except (json.JSONDecodeError, KeyError):
+                pass
+            break  # only check first file's bundle
+
+    if chapters_loaded:
+        chapter_lines = ["", "=== CHAPTER MARKERS (from source) ==="]
+        for ch in chapters_loaded:
+            chapter_lines.append(f"{ch.get('timestamp', '?')} {ch.get('title', '')}")
+        chapter_lines.append("")
+        prescan_context = prescan_context.rstrip("\n") + "\n" + "\n".join(chapter_lines) + "\n"
+
+    _prepare_dump_json(work_dir / "prepare_state.json", state_payload)
+    _prepare_dump_json(work_dir / "prepare_plan.json", plan_payload)
+    (work_dir / "prescan_context.txt").write_text(prescan_context, encoding="utf-8")
+    (work_dir / "prepare_report.txt").write_text(report, encoding="utf-8")
+
+    return {
+        "work_dir": str(work_dir),
+        "fingerprint": fingerprint,
+        "speaker_stage": speaker_stage,
+        "speaker_stage_reason": speaker_reason,
+        "files": len(meta),
+        "total_lines": sum(item.lines for item in meta),
+        "total_chunks": len(plan),
+        "report_path": str(work_dir / "prepare_report.txt"),
+        "plan_path": str(work_dir / "prepare_plan.json"),
+        "state_path": str(work_dir / "prepare_state.json"),
+        "prescan_context_path": str(work_dir / "prescan_context.txt"),
+    }
+
+
+def cmd_prepare(args: argparse.Namespace) -> int:
+    files = [ensure_file(Path(item), "Transcript file") for item in args.files]
+    result = run_prepare_logic(files)
+    work_dir = Path(result["work_dir"])
+    payload = load_prepare_payload(work_dir)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(f"Work dir: {payload['work_dir']}")
+    print(f"Files: {payload['files']}")
+    print(f"Lines: {payload['total_lines']}")
+    print(f"Chunks: {payload['total_chunks']}")
+    print(f"Speakers: {payload['unique_speakers']}")
+    print(f"Duration: {payload['duration_estimate']}")
+    return 0
+
+
+def build_status(work_dir: Path) -> dict:
+    prepare_payload = load_prepare_payload(work_dir)
+    block_files = sorted(work_dir.glob("chunk_*_block_*.md"))
+    manifest_parts = sorted(work_dir.glob("manifest_chunk_*.tsv"))
+    outputs = sorted(work_dir.glob("*.html"))
+    markdown_outputs = sorted(work_dir.glob("*.md"))
+    chunk_plan = prepare_payload.get("chunk_plan", [])
+    if not isinstance(chunk_plan, list):
+        chunk_plan = []
+    chunk_statuses = build_chunk_statuses(work_dir, chunk_plan)
+    stages = build_stage_statuses(work_dir, prepare_payload, chunk_statuses)
+    return {
+        "work_dir": str(work_dir),
+        "fingerprint": prepare_payload.get("fingerprint"),
+        "chunk_plan": chunk_plan,
+        "chunk_statuses": chunk_statuses,
+        "stage_hints": prepare_payload.get("stage_hints", {}),
+        "stage_statuses": prepare_payload.get("stage_statuses", {}),
+        "stages": stages,
+        "next_action": determine_next_action(stages),
+        "counts": {
+            "block_files": len(block_files),
+            "manifest_parts": len(manifest_parts),
+            "html_outputs": len(outputs),
+            "markdown_outputs": len(markdown_outputs),
+        },
+        "exists": {
+            "prepare_report": (work_dir / "prepare_report.txt").exists(),
+            "prepare_state": find_prepare_state_path(work_dir) is not None,
+            "prescan_context": (work_dir / "prescan_context.txt").exists(),
+            "header": (work_dir / "header.md").exists(),
+            "tldr": (work_dir / "tldr.md").exists(),
+            "appendix": (work_dir / "appendix.md").exists(),
+            "merged_manifest": (work_dir / "manifest.tsv").exists(),
+        },
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    work_dir = ensure_dir(Path(args.work_dir), "Work directory")
+    payload = build_status(work_dir)
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(f"Work dir: {payload['work_dir']}")
+    print(f"Next action: {payload['next_action']}")
+    for name, exists in payload["exists"].items():
+        print(f"- {name}: {'ready' if exists else 'missing'}")
+    for name, count in payload["counts"].items():
+        print(f"- {name}: {count}")
+    return 0
+
+
+SPEAKER_MAPPING_RE = re.compile(
+    r"^(Speaker\s+\d+|Unmarked\s+(?:lines|speaker)(?:\s*\([^)]*\))?)\s*→\s*(.+)"
+)
+REPLACE_SPEAKERS_TARGET_PATTERNS = (
+    "chunk_*_block_*.md",
+    "manifest_chunk_*.tsv",
+    "summary_chunk_*.md",
+    "tldr.md",
+)
+
+
+def replace_speakers(work_dir: Path) -> dict:
+    """Replace Speaker N labels with real names from speakers.txt."""
+    speakers_file = work_dir / "speakers.txt"
+    if not speakers_file.is_file():
+        return {"modified": 0, "mappings": 0, "skipped": True, "reason": "no speakers.txt"}
+
+    mappings: list[tuple[str, str]] = []
+    for line in speakers_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("NOTE:"):
+            continue
+        m = SPEAKER_MAPPING_RE.match(line)
+        if m:
+            pattern = m.group(1).strip()
+            replacement = m.group(2).strip()
+            if pattern and replacement:
+                mappings.append((pattern, replacement))
+
+    if not mappings:
+        return {"modified": 0, "mappings": 0, "skipped": True, "reason": "no valid mappings"}
+
+    # Sort by pattern length DESC (Speaker 10 before Speaker 1)
+    mappings.sort(key=lambda x: len(x[0]), reverse=True)
+
+    target_files: list[Path] = []
+    for pat in REPLACE_SPEAKERS_TARGET_PATTERNS:
+        target_files.extend(sorted(work_dir.glob(pat)))
+
+    modified = 0
+    for fpath in target_files:
+        text = fpath.read_text(encoding="utf-8")
+        original = text
+        for pattern, replacement in mappings:
+            bold_pattern_re = re.compile(r'\*\*' + re.escape(pattern) + r'\*\*')
+            text = bold_pattern_re.sub(f'**{replacement}**', text)
+            pattern_re = re.compile(r'\b' + re.escape(pattern) + r'\b')
+            text = pattern_re.sub(replacement, text)
+        if text != original:
+            fpath.write_text(text, encoding="utf-8")
+            modified += 1
+
+    return {"modified": modified, "mappings": len(mappings), "skipped": False}
+
+
+def cmd_replace_speakers(args: argparse.Namespace) -> int:
+    work_dir = ensure_dir(Path(args.work_dir), "Work directory")
+    result = replace_speakers(work_dir)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if result.get("skipped"):
+        print(result.get("reason", "skipped"))
+    else:
+        print(f"Replaced {result['mappings']} speaker labels in {result['modified']} files")
+    return 0
+
+
+def cmd_assemble(args: argparse.Namespace) -> int:
+    if not ASSEMBLE_SCRIPT.is_file():
+        raise FileNotFoundError(f"Assemble script not found: {ASSEMBLE_SCRIPT}")
+    work_dir = ensure_dir(Path(args.work_dir), "Work directory")
+    output_md = Path(args.output_md).expanduser().resolve()
+    output_html = Path(args.output_html).expanduser().resolve()
+    output_md.parent.mkdir(parents=True, exist_ok=True)
+    output_html.parent.mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run(
+        ["bash", str(ASSEMBLE_SCRIPT), str(work_dir), str(output_md), str(output_html), args.title],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout, file=sys.stderr, end="")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        return result.returncode
+
+    try:
+        telegram_delivery = deliver_html_to_telegram(output_html, title=args.title, chat_override=getattr(args, 'send_to', None))
+    except (ValueError, FileNotFoundError) as exc:
+        telegram_delivery = {
+            "enabled": True,
+            "attempted": True,
+            "success": False,
+            "file_path": str(output_html),
+            "error": f"telegram delivery failed: {exc}",
+        }
+    update_bundle_run_state(output_md, output_html, title=args.title, telegram_delivery=telegram_delivery)
+
+    payload = {
+        "work_dir": str(work_dir),
+        "output_md": str(output_md),
+        "output_html": str(output_html),
+        "telegram_delivery": telegram_delivery,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print(f"Markdown: {output_md}")
+    print(f"HTML: {output_html}")
+    if telegram_delivery["attempted"]:
+        status = "ok" if telegram_delivery["success"] else "failed"
+        print(f"Telegram delivery: {status}")
+    return 0
+
+
+TEXT_EXTENSIONS = {".md", ".txt"}
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    """Process all supported files in a directory."""
+    directory = Path(args.directory).expanduser().resolve()
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Directory not found: {directory}")
+
+    supported = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS | TEXT_EXTENSIONS
+    files = sorted(
+        f for f in directory.iterdir()
+        if f.is_file() and f.suffix.lower() in supported
+    )
+    if not files:
+        print(f"No supported files found in {directory}", file=sys.stderr)
+        return 1
+
+    results: list[dict] = []
+    total = len(files)
+    for i, file_path in enumerate(files, 1):
+        ext = file_path.suffix.lower()
+        label = file_path.name
+        print(f"[{i}/{total}] {label}...", file=sys.stderr)
+
+        # Build a fake args namespace for the sub-command
+        sub_args = argparse.Namespace(
+            path=str(file_path),
+            output_root=args.output_root,
+            title=None,
+            prepare=args.prepare,
+            refresh=args.refresh,
+            json=True,  # always capture JSON internally
+        )
+
+        try:
+            if ext in TEXT_EXTENSIONS:
+                # Capture stdout
+                import io
+                old_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    cmd_local(sub_args)
+                    output = sys.stdout.getvalue()
+                finally:
+                    sys.stdout = old_stdout
+            elif ext in (AUDIO_EXTENSIONS | VIDEO_EXTENSIONS):
+                sub_args.model = args.model
+                sub_args.language = args.language
+                sub_args.transcribe_backend = args.transcribe_backend
+                sub_args.diarize = False
+                import io
+                old_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    cmd_audio(sub_args)
+                    output = sys.stdout.getvalue()
+                finally:
+                    sys.stdout = old_stdout
+            else:
+                continue
+
+            result = json.loads(output)
+            results.append({"file": label, "status": "ok", **result})
+            print(f"  ✓ {result.get('bundle_dir', 'done')}", file=sys.stderr)
+        except Exception as exc:
+            results.append({"file": label, "status": "error", "error": str(exc)})
+            print(f"  ✗ {exc}", file=sys.stderr)
+
+    # Write course index
+    index_path = Path(args.output_root) / "batch-index.json"
+    write_json(index_path, {"files": results, "total": total, "ok": sum(1 for r in results if r["status"] == "ok")})
+
+    # Generate course-level HTML index
+    html_index_path = Path(args.output_root) / "batch-index.html"
+    ok_results = [r for r in results if r.get("status") == "ok"]
+    if ok_results:
+        html_lines = [
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>",
+            "<title>Course Notes Index</title>",
+            "<style>body{font-family:system-ui;max-width:800px;margin:2em auto;padding:0 1em}",
+            "a{color:#2563eb;text-decoration:none}a:hover{text-decoration:underline}",
+            "li{margin:0.5em 0}.meta{color:#666;font-size:0.85em}</style></head>",
+            "<body><h1>Course Notes</h1><ol>",
+        ]
+        for r in ok_results:
+            title = r.get("title", r.get("file", "Unknown"))
+            bundle = r.get("bundle_dir", "")
+            html_candidates = sorted(Path(bundle).glob("*.html"))
+            html_name = html_candidates[0] if html_candidates else None
+            if html_name:
+                rel = os.path.relpath(html_name, Path(args.output_root))
+                html_lines.append(f'<li><a href="{rel}">{html.escape(title)}</a></li>')
+            else:
+                html_lines.append(f"<li>{html.escape(title)} <span class='meta'>(no HTML)</span></li>")
+        html_lines.append("</ol></body></html>")
+        write_text(html_index_path, "\n".join(html_lines))
+        if not args.json:
+            print(f"HTML index: {html_index_path}")
+
+    if args.json:
+        print(json.dumps({"results": results, "index": str(index_path)}, ensure_ascii=False, indent=2))
+    else:
+        ok = sum(1 for r in results if r["status"] == "ok")
+        print(f"\nBatch complete: {ok}/{total} succeeded. Index: {index_path}")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check prerequisites and environment."""
+    checks = {}
+
+    # Platform
+    checks["platform"] = sys.platform
+    checks["python_version"] = sys.version.split()[0]
+
+    # Required tools
+    for tool in ("pandoc", "yt-dlp", "ffmpeg", "uv"):
+        checks[tool] = shutil.which(tool) is not None
+
+    # API keys (presence only, not values)
+    checks["GROQ_API_KEY"] = bool(os.environ.get("GROQ_API_KEY"))
+    checks["ELEVENLABS_API_KEY"] = bool(os.environ.get("ELEVENLABS_API_KEY"))
+
+    # Optional Python modules
+    checks["mlx_whisper"] = python_module_available("mlx_whisper") if is_macos() else "n/a (macOS only)"
+    checks["whisperx"] = shutil.which("whisperx") is not None
+    checks["youtube_transcript_api"] = python_module_available("youtube_transcript_api")
+
+    # Config
+    checks["config_json"] = NOTES_CONFIG_PATH.is_file()
+
+    # Audio transcription available
+    has_audio = (
+        checks.get("GROQ_API_KEY", False)
+        or checks.get("ELEVENLABS_API_KEY", False)
+        or (is_macos() and checks.get("mlx_whisper") is True)
+    )
+    checks["audio_transcription_ready"] = has_audio
+
+    if getattr(args, "json", False):
+        print(json.dumps(checks, indent=2, default=str))
+        return 0
+
+    # Human-readable output
+    print("notes-runner doctor\n")
+    for key, value in checks.items():
+        if isinstance(value, bool):
+            icon = "\u2713" if value else "\u2717"
+            print(f"  {icon}  {key}")
+        else:
+            print(f"  -  {key}: {value}")
+
+    print()
+    if not has_audio:
+        print("  ! No audio transcription backend available.")
+        if is_macos():
+            print("    Install mlx-whisper: pip install mlx-whisper")
+            print("    Or set GROQ_API_KEY (free at console.groq.com)")
+        else:
+            print("    Set GROQ_API_KEY (free at console.groq.com)")
+    else:
+        print("  Ready to create notes!")
+
+    return 0
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        if args.command == "batch":
+            return cmd_batch(args)
+        if args.command == "prepare":
+            return cmd_prepare(args)
+        if args.command == "status":
+            return cmd_status(args)
+        if args.command == "replace-speakers":
+            return cmd_replace_speakers(args)
+        if args.command == "assemble":
+            return cmd_assemble(args)
+        if args.command == "youtube":
+            return cmd_youtube(args)
+        if args.command == "local":
+            return cmd_local(args)
+        if args.command == "audio":
+            return cmd_audio(args)
+        if args.command == "telegram":
+            return cmd_telegram(args)
+        if args.command == "auto":
+            return cmd_auto(args)
+        if args.command == "doctor":
+            return cmd_doctor(args)
+        parser.error(f"Unsupported command: {args.command}")
+    except KeyboardInterrupt:
+        print("Cancelled.", file=sys.stderr)
+        return 130
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

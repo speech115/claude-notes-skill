@@ -1,0 +1,8 @@
+{
+  "telegram_delivery": {
+    "enabled": false,
+    "chat": "",
+    "mcp_url": "http://127.0.0.1:8799/mcp",
+    "parse_mode": "md"
+  }
+}

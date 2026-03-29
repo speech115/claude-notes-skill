@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="$lang$" xml:lang="$lang$"$if(dir)$ dir="$dir$"$endif$>
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+$if(source-url)$
+  <meta name="source-url" content="$source-url$" />
+$endif$
+$for(author-meta)$
+  <meta name="author" content="$author-meta$" />
+$endfor$
+  <title>$if(title-prefix)$$title-prefix$ – $endif$$pagetitle$</title>
+$for(header-includes)$
+  $header-includes$
+$endfor$
+</head>
+<body>
+$for(include-before)$
+$include-before$
+$endfor$
+$if(title)$
+<header id="title-block-header">
+<h1 class="title">$title$</h1>
+$if(subtitle)$
+<p class="subtitle">$subtitle$</p>
+$endif$
+$for(author)$
+<p class="author">$author$</p>
+$endfor$
+</header>
+$endif$
+$if(toc)$
+<nav id="$idprefix$TOC" role="doc-toc">
+$table-of-contents$
+</nav>
+$endif$
+$body$
+<button id="back-to-top" title="Наверх">&#8593;</button>
+<script>
+const btn = document.getElementById('back-to-top');
+window.addEventListener('scroll', () => {
+  btn.classList.toggle('visible', window.scrollY > 400);
+});
+btn.addEventListener('click', () => window.scrollTo({top: 0}));
+
+// Clickable YouTube timestamps in h2 headings
+(function() {
+  var meta = document.querySelector('meta[name="source-url"]');
+  if (!meta || !meta.content.match(/youtu/)) return;
+  var baseUrl = meta.content.replace(/[&?]t=\d+/, '');
+  var separator = baseUrl.indexOf('?') === -1 ? '?' : '&';
+  document.querySelectorAll('h2').forEach(function(h2) {
+    h2.innerHTML = h2.innerHTML.replace(/(\d{1,2}):(\d{2}):(\d{2})/g, function(match, h, m, s) {
+      var seconds = parseInt(h) * 3600 + parseInt(m) * 60 + parseInt(s);
+      return '<a href="' + baseUrl + separator + 't=' + seconds + '" target="_blank" class="timestamp-link">' + match + '</a>';
+    });
+    h2.innerHTML = h2.innerHTML.replace(/(?<!\d:)(\d{1,2}):(\d{2})(?!:\d{2}|<\/a>)/g, function(match, m, s) {
+      var seconds = parseInt(m) * 60 + parseInt(s);
+      return '<a href="' + baseUrl + separator + 't=' + seconds + '" target="_blank" class="timestamp-link">' + match + '</a>';
+    });
+  });
+})();
+</script>
+$for(include-after)$
+$include-after$
+$endfor$
+</body>
+</html>
