@@ -718,7 +718,8 @@ def call_parakeet_transcribe(audio_path: Path, language: str | None = None) -> s
     from parakeet_mlx import from_pretrained  # type: ignore[import-untyped]
 
     model = from_pretrained("mlx-community/parakeet-tdt-0.6b-v3")
-    result = model.transcribe(str(audio_path))
+    # chunk_duration prevents OOM on long files (Metal buffer limit ~16GB)
+    result = model.transcribe(str(audio_path), chunk_duration=300, overlap_duration=10)
 
     lines = []
     for sentence in result.sentences:
