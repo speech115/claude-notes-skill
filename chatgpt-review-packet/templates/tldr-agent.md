@@ -1,20 +1,21 @@
 # TL;DR Agent Prompt
 
-Launch **ONE** agent that reads summary files, note contract, and manifest primary claims.
+Launch **ONE** sonnet-model agent that reads ONLY the summary files (not all blocks — saves context).
 
 ## Prompt
 
 ```
 Read all summary_chunk_*.md files in $WORK_DIR (sorted).
-Read $WORK_DIR/note-contract.json for the min/max TL;DR bounds.
-Use manifest `primary_claim` fields when summaries are thin.
 
 Write ONE file: $WORK_DIR/tldr.md
 Numbered key takeaways. Just the list, no heading. One sentence each.
-Based on the summaries and manifests you read.
+Based on the summaries you read.
 
-Determine the number of takeaways from note-contract.json, not from raw file count alone.
-Deduplicate near-identical bullets aggressively.
+Determine the number of takeaways based on content volume:
+- If there is 1 summary file (short recording): 5 takeaways
+- If there are 2 summary files: 7-10 takeaways
+- If there are 3-4 summary files: 10-12 takeaways
+- If there are 5+ summary files: 12-15 takeaways
 
 Output in Russian. Only use information from the files — do NOT invent.
 Do NOT add version numbers, model names, or facts from your own knowledge — only what appears in the source files. If a file says "Claude" without a version, write "Claude", not "Claude Opus 4.5".

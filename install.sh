@@ -1,11 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="speech115/claude-notes-skill"
-BRANCH="main"
-SKILL_DIR="${HOME}/.claude/skills/notes"
+# Public GitHub default for remote installs.
+REPO_SLUG="${NOTES_INSTALL_REPO:-speech115/notes-skill}"
+REPO_REF="${NOTES_INSTALL_REF:-main}"
+CODEX_SKILL_DIR="${HOME}/.agents/skills/notes"
+LEGACY_SKILL_DIR="${HOME}/.claude/skills/notes"
 
-echo "=== Claude Notes Skill Installer ==="
+choose_skill_dir() {
+  if [[ -n "${NOTES_SKILL_TARGET_DIR:-}" ]]; then
+    echo "${NOTES_SKILL_TARGET_DIR}"
+    return
+  fi
+  if [[ -d "$CODEX_SKILL_DIR" || ! -d "$LEGACY_SKILL_DIR" ]]; then
+    echo "$CODEX_SKILL_DIR"
+  else
+    echo "$LEGACY_SKILL_DIR"
+  fi
+}
+
+SKILL_DIR="$(choose_skill_dir)"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+TMPDIR=""
+
+cleanup() {
+  if [[ -n "${TMPDIR:-}" && -d "${TMPDIR:-}" ]]; then
+    rm -rf "$TMPDIR"
+  fi
+}
+trap cleanup EXIT
+
+echo "=== Notes Skill Installer ==="
 echo ""
 
 # Platform detection
@@ -71,44 +97,46 @@ if [[ "$MISSING_DEPS" -eq 1 ]]; then
   exit 1
 fi
 
-# Download and install
+# Source selection
 echo ""
 echo "Installing to $SKILL_DIR ..."
 
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
-
-if [[ -d "$SKILL_DIR/.git" ]]; then
-  echo "Git repo detected, pulling latest..."
-  cd "$SKILL_DIR" && git pull origin "$BRANCH" --ff-only
+if [[ -f "$SCRIPT_DIR/SKILL.md" && -f "$SCRIPT_DIR/scripts/notes-runner" ]]; then
+  SOURCE_DIR="$SCRIPT_DIR"
 else
-  curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" \
+  TMPDIR="$(mktemp -d -t notes-skill-install-XXXXXX)"
+  curl -fsSL "https://github.com/$REPO_SLUG/archive/refs/heads/$REPO_REF.tar.gz" \
     | tar -xz -C "$TMPDIR" --strip-components=1
+  SOURCE_DIR="$TMPDIR"
+fi
 
-  mkdir -p "$SKILL_DIR/block-templates" "$SKILL_DIR/scripts"
+mkdir -p "$SKILL_DIR"
+rsync -a --delete \
+  --exclude '.git/' \
+  --exclude 'backups/' \
+  --exclude 'config.json' \
+  --exclude '.ai/runtime/' \
+  --exclude 'scripts/__pycache__/' \
+  --exclude 'RELEASE.md' \
+  --exclude 'VERSION' \
+  "$SOURCE_DIR/" "$SKILL_DIR/"
 
-  # Copy core files
-  for f in SKILL.md README.md ADVANCED.md assemble.sh prepare.sh template.html dark-theme.css config.example.json; do
-    cp "$TMPDIR/$f" "$SKILL_DIR/$f" 2>/dev/null || true
-  done
-  cp "$TMPDIR"/block-templates/*.md "$SKILL_DIR/block-templates/" 2>/dev/null || true
-  cp "$TMPDIR"/scripts/notes-runner "$SKILL_DIR/scripts/notes-runner" 2>/dev/null || true
-  cp "$TMPDIR"/scripts/replace-speakers.sh "$SKILL_DIR/scripts/replace-speakers.sh" 2>/dev/null || true
-
-  # Create config.json only if it doesn't exist
-  if [[ ! -f "$SKILL_DIR/config.json" ]]; then
-    cp "$TMPDIR/config.example.json" "$SKILL_DIR/config.json"
-  fi
+if [[ ! -f "$SKILL_DIR/config.json" ]]; then
+  cp "$SOURCE_DIR/config.example.json" "$SKILL_DIR/config.json"
 fi
 
 chmod +x "$SKILL_DIR/scripts/notes-runner" "$SKILL_DIR/assemble.sh" "$SKILL_DIR/prepare.sh" 2>/dev/null || true
+chmod 600 "$SKILL_DIR/config.json" 2>/dev/null || true
 
 echo ""
 echo "=== Installed! ==="
 echo ""
-echo "Restart Claude Code, then try:"
+echo "Restart your agent client, then try:"
 echo "  /notes https://www.youtube.com/watch?v=..."
 echo "  /notes /path/to/file.md"
+echo ""
+echo "Config note:"
+echo "  config.json is local-only and should not be committed or shared."
 echo ""
 
 # Audio transcription guidance

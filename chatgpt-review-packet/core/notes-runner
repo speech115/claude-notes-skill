@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import html
 import hashlib
 import importlib.util
@@ -19,7 +18,6 @@ import tempfile
 import time
 import unicodedata
 import urllib.request
-from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +42,6 @@ LANGUAGE_CODE_RE = re.compile(r"\.([a-z]{2}(?:-[A-Za-z0-9]+)?)(?:-orig)?\.vtt$",
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 DEFAULT_TELEGRAM_MCP_URL = "http://127.0.0.1:8799/mcp"
 DEFAULT_TELEGRAM_CAPTION_TEMPLATE = ""
-DEFAULT_TELEGRAM_CHAT = "-1003850136767"
 MARKDOWN_H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$")
 TITLE_TIMESTAMP_PREFIX_RE = re.compile(r"^(?:\*?\d{1,2}:\d{2}(?::\d{2})?\*?\s+)+", re.IGNORECASE)
 TITLE_SPEAKER_PREFIX_RE = re.compile(r"^(?:\*\*)?speaker\s+\d+(?:\*\*)?\s*:?\s*", re.IGNORECASE)
@@ -52,8 +49,6 @@ TITLE_GENERIC_STEM_RE = re.compile(r"^(?:transcript|notes|summary|audio|video|re
 PROMPT_PACK_DIRNAME = "prompts"
 STAGE_STATE_DIRNAME = "stages"
 HEADER_SEED_FILENAME = "header-seed.json"
-NOTE_CONTRACT_FILENAME = "note-contract.json"
-QUALITY_CHECKS_FILENAME = "quality-checks.json"
 
 
 def advanced_setup_message(feature: str, hint: str | None = None) -> str:
@@ -133,13 +128,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tldr_parser.add_argument("work_dir", help="Work directory path.")
     tldr_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON result.")
-
-    appendix_parser = subparsers.add_parser(
-        "ensure-appendix",
-        help="Build appendix.md deterministically from manifests and summaries when needed.",
-    )
-    appendix_parser.add_argument("work_dir", help="Work directory path.")
-    appendix_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON result.")
 
     assemble_parser = subparsers.add_parser("assemble", help="Run assemble.sh for an existing work dir.")
     assemble_parser.add_argument("work_dir", help="Work directory path.")
@@ -563,28 +551,6 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def note_contract_path(work_dir: Path) -> Path:
-    return work_dir / NOTE_CONTRACT_FILENAME
-
-
-def quality_checks_path(work_dir: Path) -> Path:
-    return work_dir / QUALITY_CHECKS_FILENAME
-
-
-def load_json_if_exists(path: Path) -> dict | None:
-    if not path.is_file():
-        return None
-    try:
-        payload = load_json(path)
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def write_quality_checks(work_dir: Path, payload: dict) -> None:
-    write_json(quality_checks_path(work_dir), payload)
-
-
 def extract_youtube_chapters(metadata: dict) -> list[dict]:
     """Extract chapter markers from YouTube metadata.
 
@@ -639,36 +605,15 @@ def extract_youtube_chapters(metadata: dict) -> list[dict]:
 
 
 def load_notes_config() -> dict:
-    default_delivery = {
-        "enabled": True,
-        "chat": DEFAULT_TELEGRAM_CHAT,
-        "mcp_url": DEFAULT_TELEGRAM_MCP_URL,
-        "parse_mode": "md",
-    }
-    default_config = {
-        "telegram_delivery": default_delivery,
-    }
     if not NOTES_CONFIG_PATH.is_file():
-        return default_config
+        return {}
     try:
         payload = load_json(NOTES_CONFIG_PATH)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Notes config is not valid JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Notes config must be a JSON object: {NOTES_CONFIG_PATH}")
-    merged = dict(payload)
-    raw_delivery = payload.get("telegram_delivery")
-    if raw_delivery is None:
-        merged["telegram_delivery"] = default_delivery
-        return merged
-    if not isinstance(raw_delivery, dict):
-        raise ValueError("notes config field 'telegram_delivery' must be a JSON object")
-    merged_delivery = dict(default_delivery)
-    merged_delivery.update(raw_delivery)
-    if not str(merged_delivery.get("chat") or "").strip():
-        merged_delivery["chat"] = DEFAULT_TELEGRAM_CHAT
-    merged["telegram_delivery"] = merged_delivery
-    return merged
+    return payload
 
 
 def read_text_file(path: Path) -> str:
@@ -811,233 +756,6 @@ def _render_source_hint_lines(source_hints: dict | None) -> list[str]:
             lines.append(f"YouTube channel/uploader metadata: {identity_line}")
         lines.append("If the transcript is a single-speaker YouTube monologue, prefer this real name over generic labels like Speaker 1 or Автор.")
     return lines
-
-
-def total_duration_seconds_for_meta(meta: list[FileMeta]) -> int:
-    for item in reversed(meta):
-        seconds = _parse_duration_to_seconds(item.duration_estimate)
-        if seconds > 0:
-            return seconds
-    return 0
-
-
-def format_label_for_content_mode(content_mode: str) -> str:
-    return {
-        "monologue": "лекция",
-        "conversation": "интервью",
-        "workshop": "воркшоп",
-    }.get(content_mode, "разбор")
-
-
-def tldr_bounds_for(content_mode: str, duration_seconds: int, total_chunks: int) -> tuple[int, int]:
-    minutes = duration_seconds / 60 if duration_seconds > 0 else 0
-    if content_mode == "monologue":
-        if minutes and minutes <= 18:
-            return (5, 6)
-        if minutes and minutes <= 35:
-            return (6, 8)
-        return (7, 9) if total_chunks <= 3 else (8, 10)
-    if content_mode == "conversation":
-        if minutes and minutes <= 30:
-            return (6, 8)
-        return (7, 10)
-    if minutes and minutes <= 35:
-        return (7, 9)
-    return (8, 12)
-
-
-def _prepare_classify_content_mode(
-    files: list[FileMeta],
-    speaker_stage: str,
-    *,
-    source_hints: dict | None = None,
-) -> tuple[str, str]:
-    total_markers = sum(item.markers for item in files)
-    total_dialogue = sum(item.dialogue_cues for item in files)
-    total_dialogue_speakers = sum(item.dialogue_speakers for item in files)
-    total_intro = sum(item.intro_cues for item in files)
-    total_lines = sum(item.lines for item in files)
-    duration_seconds = total_duration_seconds_for_meta(files)
-    source_kind = str((source_hints or {}).get("source_kind") or "").strip()
-    author_hint = _cleanup_person_hint(str((source_hints or {}).get("author_hint") or ""))
-    has_author_hint = _is_informative_person_hint(author_hint)
-
-    weak_dialogue = total_markers <= 1 and total_dialogue <= 1 and total_dialogue_speakers <= 1 and total_intro <= 1
-    dense_multi_speaker = total_markers >= 3 or total_dialogue >= 8 or total_intro >= 3
-    long_facilitated_session = duration_seconds >= 45 * 60 and (total_dialogue >= 5 or total_markers >= 2)
-    short_facilitated_group = total_dialogue_speakers >= 3 and total_intro >= 1
-
-    if source_kind == "youtube" and has_author_hint and weak_dialogue and (duration_seconds == 0 or duration_seconds <= 45 * 60):
-        return "monologue", "youtube author hint plus weak dialog cues indicate a single-speaker monologue"
-    if speaker_stage == "skip" and weak_dialogue:
-        return "monologue", "speaker routing already indicates lecture-style single-speaker content"
-    if dense_multi_speaker or long_facilitated_session or short_facilitated_group:
-        return "workshop", "dense multi-speaker interaction suggests workshop or facilitated session"
-    if speaker_stage == "required" or total_markers >= 2 or total_dialogue >= 3 or total_intro >= 2:
-        return "conversation", "dialog cues suggest an interview or conversation"
-    if total_lines >= 2200 and duration_seconds >= 35 * 60:
-        return "workshop", "long multi-topic material defaults to workshop-style handling"
-    return "conversation", "ambiguous material defaults to conversation-safe processing"
-
-
-def _prepare_effective_speaker_stage(
-    files: list[FileMeta],
-    speaker_stage: str,
-    speaker_reason: str,
-    *,
-    source_hints: dict | None = None,
-) -> tuple[str, str, str, str]:
-    content_mode, content_reason = _prepare_classify_content_mode(files, speaker_stage, source_hints=source_hints)
-    author_hint = _cleanup_person_hint(str((source_hints or {}).get("author_hint") or ""))
-    source_kind = str((source_hints or {}).get("source_kind") or "").strip()
-    if content_mode == "monologue" and source_kind == "youtube" and _is_informative_person_hint(author_hint):
-        return (
-            "skip",
-            f"monologue fast path: {content_reason}",
-            content_mode,
-            content_reason,
-        )
-    if content_mode == "monologue" and speaker_stage == "optional":
-        return (
-            "skip",
-            f"monologue fast path: {content_reason}",
-            content_mode,
-            content_reason,
-        )
-    return speaker_stage, speaker_reason, content_mode, content_reason
-
-
-def execution_mode_for_plan(total_chunks: int, *, content_mode: str, duration_seconds: int = 0) -> str:
-    if total_chunks <= 1:
-        return "single"
-    if content_mode == "monologue":
-        if duration_seconds and duration_seconds <= 18 * 60 and total_chunks <= 2:
-            return "single"
-        if total_chunks <= 4 and (duration_seconds == 0 or duration_seconds <= 35 * 60):
-            return "micro-multi"
-    if total_chunks <= 3:
-        return "micro-multi"
-    return "multi"
-
-
-def build_note_contract(
-    *,
-    work_dir: Path,
-    content_mode: str,
-    execution_mode: str,
-    header_seed: dict,
-    total_chunks: int,
-    duration_seconds: int,
-) -> dict:
-    tldr_min, tldr_max = tldr_bounds_for(content_mode, duration_seconds, total_chunks)
-    author_hint = _cleanup_person_hint(str(header_seed.get("author_hint") or ""))
-    required_metadata = ["Формат", "Тема", "Длительность", "Источник"]
-    if _is_informative_person_hint(author_hint):
-        required_metadata.insert(0, "Автор")
-    optional_metadata = ["Участники"] if content_mode != "monologue" else []
-    required_sections = [
-        "title",
-        "abstract",
-        "metadata",
-        "главная_рамка_автора",
-        "коротко_о_главном",
-        "основные_блоки",
-        "упомянутые_люди_и_ресурсы",
-    ]
-    optional_sections = ["план_действий", "ключевые_идеи_и_модели"]
-    return {
-        "schema_version": 1,
-        "work_dir": str(work_dir),
-        "content_mode": content_mode,
-        "execution_mode": execution_mode,
-        "enforce_on_assemble": True,
-        "header": {
-            "required_metadata": required_metadata,
-            "optional_metadata": optional_metadata,
-            "format_label": format_label_for_content_mode(content_mode),
-            "author_hint": author_hint or None,
-            "author_frame_style": "three-bullets",
-        },
-        "blocks": {
-            "theses_min": 5,
-            "theses_max": 8,
-            "meaning_section": "optional",
-            "meaning_label": "Смысл блока",
-            "case_optional": True,
-            "dialogue_optional": content_mode != "monologue",
-            "quote_max_per_block": 1,
-        },
-        "tldr": {
-            "required": True,
-            "strategy": "inline-extraction" if execution_mode == "single" else "deterministic-merge" if execution_mode == "micro-multi" else "agent",
-            "min_items": tldr_min,
-            "max_items": tldr_max,
-        },
-        "section_order": [
-            "header",
-            "коротко_о_главном",
-            "основные_блоки",
-            "упомянутые_люди_и_ресурсы",
-            "план_действий",
-            "ключевые_идеи_и_модели",
-        ],
-        "required_sections": required_sections,
-        "optional_sections": optional_sections,
-        "forbidden_placeholders": ["Speaker N", "—", "unknown"],
-        "paths": {
-            "header_seed": str(work_dir / HEADER_SEED_FILENAME),
-        },
-    }
-
-
-def build_prepare_quality_checks(
-    *,
-    content_mode: str,
-    execution_mode: str,
-    speaker_stage: str,
-    content_reason: str,
-    note_contract: dict,
-    meta: list[FileMeta],
-    plan: list[dict],
-    source_hints: dict | None = None,
-) -> dict:
-    total_lines = sum(item.lines for item in meta)
-    duration_seconds = total_duration_seconds_for_meta(meta)
-    minutes = duration_seconds / 60 if duration_seconds > 0 else 0
-    blocks_per_10m = round((len(plan) / minutes) * 10, 2) if minutes > 0 else None
-    monologue_fast_path_expected = (
-        content_mode == "monologue"
-        and str((source_hints or {}).get("source_kind") or "").strip() == "youtube"
-        and _is_informative_person_hint(_cleanup_person_hint(str((source_hints or {}).get("author_hint") or "")))
-    )
-    monologue_fast_path_ok = not monologue_fast_path_expected or (
-        speaker_stage == "skip" and execution_mode in {"single", "micro-multi"}
-    )
-    return {
-        "schema_version": 1,
-        "content_mode": content_mode,
-        "prepare": {
-            "header_contract_defined": True,
-            "speaker_routing": {
-                "ok": speaker_stage in {"skip", "optional", "required"},
-                "speaker_stage": speaker_stage,
-                "content_reason": content_reason,
-            },
-            "monologue_fast_path": {
-                "expected": monologue_fast_path_expected,
-                "ok": monologue_fast_path_ok,
-            },
-            "fragmentation": {
-                "total_lines": total_lines,
-                "duration_seconds": duration_seconds,
-                "planned_chunks": len(plan),
-                "content_blocks_per_10min": blocks_per_10m,
-                "ok": blocks_per_10m is None or blocks_per_10m <= 1.8,
-            },
-            "tldr_bounds": note_contract.get("tldr", {}),
-        },
-        "final": {},
-    }
 
 
 def _inject_source_hints_into_prescan_context(text: str, source_hints: dict | None) -> str:
@@ -1861,23 +1579,6 @@ def enrich_work_dir_with_source_hints(work_dir: Path, source_hints: dict | None)
     )
     write_json(header_seed_path, merged_header_seed)
 
-    prepare_state = load_json_file(find_prepare_state_path(work_dir) or Path()) if find_prepare_state_path(work_dir) else {}
-    if not isinstance(prepare_state, dict):
-        prepare_state = {}
-    content_mode = str(prepare_state.get("content_mode") or "conversation")
-    execution_mode = str(prepare_state.get("execution_mode") or execution_mode_for_plan(0, content_mode=content_mode))
-    total_chunks = int(prepare_state.get("total_chunks") or 0)
-    duration_seconds = int((prepare_state.get("telemetry") or {}).get("duration_seconds") or 0) if isinstance(prepare_state.get("telemetry"), dict) else 0
-    refreshed_contract = build_note_contract(
-        work_dir=work_dir,
-        content_mode=content_mode,
-        execution_mode=execution_mode,
-        header_seed=merged_header_seed,
-        total_chunks=total_chunks,
-        duration_seconds=duration_seconds,
-    )
-    write_json(note_contract_path(work_dir), refreshed_contract)
-
     prescan_path = work_dir / "prescan_context.txt"
     if prescan_path.is_file():
         prescan_text = prescan_path.read_text(encoding="utf-8", errors="replace")
@@ -1899,7 +1600,6 @@ def enrich_work_dir_with_source_hints(work_dir: Path, source_hints: dict | None)
             "header_seed": merged_header_seed,
             "title_candidates": merged_header_seed.get("title_candidates") or [],
             "source_identity": source_hints,
-            "note_contract": refreshed_contract,
         },
     )
 
@@ -2142,10 +1842,10 @@ def deliver_html_to_telegram(output_html: Path, *, title: str, chat_override: st
         chat = chat_override.strip()
     else:
         if not isinstance(delivery, dict):
-            delivery = {}
+            return build_telegram_delivery_disabled("config-missing")
         if not delivery.get("enabled", False):
             return build_telegram_delivery_disabled("disabled")
-        chat = str(delivery.get("chat") or "").strip() or DEFAULT_TELEGRAM_CHAT
+        chat = str(delivery.get("chat") or "").strip()
         if not chat:
             return {
                 "enabled": True,
@@ -2388,7 +2088,6 @@ def prepare_state_payload(work_dir: Path, state: dict | None, plan_state: dict |
         "work_dir": str(state.get("work_dir") or work_dir),
         "fingerprint": state.get("fingerprint") or state.get("run_fingerprint"),
         "execution_mode": state.get("execution_mode") or plan_state.get("execution_mode"),
-        "content_mode": state.get("content_mode") or plan_state.get("content_mode") or "conversation",
         "stage_hints": stage_hints,
         "stage_statuses": stage_statuses,
         "chunk_plan": normalize_chunk_plan(state) or normalize_chunk_plan(plan_state),
@@ -2406,10 +2105,6 @@ def prepare_state_payload(work_dir: Path, state: dict | None, plan_state: dict |
         "source_identity": state.get("source_identity") if isinstance(state.get("source_identity"), dict) else {},
         "telemetry": state.get("telemetry") if isinstance(state.get("telemetry"), dict) else {},
         "bundle_dir": state.get("bundle_dir"),
-        "note_contract": state.get("note_contract") if isinstance(state.get("note_contract"), dict) else {},
-        "quality_checks": state.get("quality_checks") if isinstance(state.get("quality_checks"), dict) else {},
-        "note_contract_path": str(note_contract_path(work_dir)) if note_contract_path(work_dir).is_file() else None,
-        "quality_checks_path": str(quality_checks_path(work_dir)) if quality_checks_path(work_dir).is_file() else None,
     }
     if payload["chunk_plan"]:
         payload["total_chunks"] = len(payload["chunk_plan"])
@@ -2425,18 +2120,7 @@ def prepare_state_payload(work_dir: Path, state: dict | None, plan_state: dict |
             }
         )
     if not payload.get("execution_mode"):
-        payload["execution_mode"] = execution_mode_for_plan(
-            int(payload.get("total_chunks") or 0),
-            content_mode=str(payload.get("content_mode") or "conversation"),
-        )
-    if not payload.get("note_contract") and payload.get("note_contract_path"):
-        contract_payload = load_json_if_exists(Path(str(payload["note_contract_path"])))
-        if isinstance(contract_payload, dict):
-            payload["note_contract"] = contract_payload
-    if not payload.get("quality_checks") and payload.get("quality_checks_path"):
-        quality_payload = load_json_if_exists(Path(str(payload["quality_checks_path"])))
-        if isinstance(quality_payload, dict):
-            payload["quality_checks"] = quality_payload
+        payload["execution_mode"] = execution_mode_for_total_chunks(int(payload.get("total_chunks") or 0))
     return payload
 
 
@@ -2674,16 +2358,10 @@ def build_execution_plan(payload: dict, chunk_statuses: dict[str, dict], stages:
         chunk_plan = []
 
     total_chunks = int(payload.get("total_chunks") or len(chunk_plan) or 0)
-    mode = str(payload.get("execution_mode") or "").strip() or execution_mode_for_plan(
-        total_chunks,
-        content_mode=str(payload.get("content_mode") or "conversation"),
-    )
-    content_mode = str(payload.get("content_mode") or "conversation")
+    mode = execution_mode_for_total_chunks(total_chunks)
     next_action = determine_next_action(stages)
     prompt_packs = payload.get("prompt_packs") if isinstance(payload.get("prompt_packs"), dict) else {}
     header_seed = payload.get("header_seed") if isinstance(payload.get("header_seed"), dict) else {}
-    note_contract = payload.get("note_contract") if isinstance(payload.get("note_contract"), dict) else {}
-    quality_checks = payload.get("quality_checks") if isinstance(payload.get("quality_checks"), dict) else {}
     title_candidates = payload.get("title_candidates") if isinstance(payload.get("title_candidates"), list) else header_seed.get("title_candidates") if isinstance(header_seed.get("title_candidates"), list) else []
 
     ready_chunk_ids: list[str] = []
@@ -2740,7 +2418,6 @@ def build_execution_plan(payload: dict, chunk_statuses: dict[str, dict], stages:
 
     return {
         "mode": mode,
-        "content_mode": content_mode,
         "resume": resume,
         "next_action": next_action,
         "speaker_identification": {
@@ -2774,12 +2451,6 @@ def build_execution_plan(payload: dict, chunk_statuses: dict[str, dict], stages:
             "prompt_path": prompt_packs.get("header"),
             "speaker_candidates": header_seed.get("speaker_candidates") if isinstance(header_seed.get("speaker_candidates"), list) else [],
             "author_hint": header_seed.get("author_hint"),
-        },
-        "contract": {
-            "note_contract_path": payload.get("note_contract_path"),
-            "quality_checks_path": payload.get("quality_checks_path"),
-            "tldr_bounds": note_contract.get("tldr") if isinstance(note_contract.get("tldr"), dict) else {},
-            "prepare_quality": quality_checks.get("prepare") if isinstance(quality_checks.get("prepare"), dict) else {},
         },
         "assemble": {
             "should_run": assemble_status != "ready" and not assemble_blocked_by,
@@ -2827,12 +2498,8 @@ def normalize_transcript_text(text: str) -> str:
     lines = deduped
 
     # Parse into structured entries: (speaker, text, timestamp)
-    # Supports both bolded markers (`**Speaker 1**: ...`) and plain speaker
-    # prefixes (`Анна: ...`) so local transcripts with named turns survive
-    # normalization instead of collapsing into a fake monologue.
-    speaker_re = re.compile(
-        r"^(?:\*\*(.+?)\*\*|([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 .,_\-]{0,40}))\s*:\s*(.*)"
-    )
+    # Format:  **Speaker N**: text\n*HH:MM* or *MM:SS*
+    speaker_re = re.compile(r"^\*\*(.+?)\*\*:\s*(.*)")
     timestamp_re = re.compile(r"^\*([^*]+)\*$")
 
     entries: list[dict[str, str]] = []
@@ -2841,8 +2508,8 @@ def normalize_transcript_text(text: str) -> str:
         line = lines[i]
         speaker_match = speaker_re.match(line)
         if speaker_match:
-            speaker = (speaker_match.group(1) or speaker_match.group(2) or "").strip()
-            spoken_text = speaker_match.group(3).strip()
+            speaker = speaker_match.group(1)
+            spoken_text = speaker_match.group(2).strip()
             # Look ahead for timestamp (possibly with an empty line in between)
             timestamp = ""
             if i + 1 < len(lines) and not lines[i + 1]:
@@ -3918,11 +3585,9 @@ def cmd_youtube(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 SPEAKER_MARKER_RE = re.compile(r"\*\*Speaker\s+(\d+)\*\*")
-DIALOGUE_PREFIX_RE = re.compile(r"^\s*(?:\*\*)?(?:[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 .,_\-]{0,40})(?:\*\*)?\s*:")
-DIALOGUE_SPEAKER_RE = re.compile(r"^\s*(?:\*\*)?([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 .,_\-]{0,40})(?:\*\*)?\s*:")
+DIALOGUE_PREFIX_RE = re.compile(r"^\s*(?:[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 .,_\-]{0,40})\s*:")
 INTRO_RE = re.compile(
-    r"(меня зовут|мне зовут|расскажи про себя|расскажите про себя|"
-    r"представься|представьтесь|представь себя|представьте себя|"
+    r"(меня зовут|мне зовут|расскажи про себя|расскажите про себя|представь(?:ся| себя)?|"
     r"я .*кодер|я .*предприниматель|я .*разработчик|кто ты такой|кто вы такой)",
     re.IGNORECASE,
 )
@@ -3944,7 +3609,6 @@ class FileMeta:
     estimated_tokens: int
     markers: int
     dialogue_cues: int
-    dialogue_speakers: int
     intro_cues: int
     clues: list[str]
     duration_estimate: str | None
@@ -4003,12 +3667,6 @@ def _prepare_detect_file_meta(path: Path) -> FileMeta:
     joined = "\n".join(lines)
     marker_matches = SPEAKER_MARKER_RE.findall(joined)
     dialogue_cues = sum(1 for line in lines if DIALOGUE_PREFIX_RE.match(line))
-    dialogue_speakers = {
-        match.group(1).strip(" *_")
-        for line in lines
-        for match in [DIALOGUE_SPEAKER_RE.match(line)]
-        if match and match.group(1).strip(" *_")
-    }
     intro_cues = sum(1 for line in lines if INTRO_RE.search(line))
     clues: list[str] = []
     for idx, line in enumerate(lines, start=1):
@@ -4029,7 +3687,6 @@ def _prepare_detect_file_meta(path: Path) -> FileMeta:
         estimated_tokens=_estimate_tokens_from_lines(lines),
         markers=len(set(marker_matches)),
         dialogue_cues=dialogue_cues,
-        dialogue_speakers=len(dialogue_speakers),
         intro_cues=intro_cues,
         clues=clues,
         duration_estimate=_prepare_last_timestamp(lines),
@@ -4039,13 +3696,12 @@ def _prepare_detect_file_meta(path: Path) -> FileMeta:
 def _prepare_classify_speaker_stage(files: list[FileMeta]) -> tuple[str, str]:
     total_markers = sum(item.markers for item in files)
     total_dialogue = sum(item.dialogue_cues for item in files)
-    total_dialogue_speakers = sum(item.dialogue_speakers for item in files)
     total_intro = sum(item.intro_cues for item in files)
     total_lines = sum(item.lines for item in files)
 
-    if total_markers >= 2 or total_dialogue >= 4 or total_intro >= 2 or total_dialogue_speakers >= 3:
+    if total_markers >= 2 or total_dialogue >= 4 or total_intro >= 2:
         return "required", "multiple speaker markers or dialog cues detected"
-    if total_markers <= 1 and total_dialogue <= 1 and total_dialogue_speakers <= 1 and total_intro <= 1 and total_lines < 1200:
+    if total_markers <= 1 and total_dialogue <= 1 and total_intro <= 1 and total_lines < 1200:
         return "skip", "single-speaker or lecture-style transcript with weak dialog cues and at most one intro cue"
     return "optional", "speaker identification may help, but content can be processed safely without it"
 
@@ -4084,7 +3740,6 @@ def _prepare_chunk_count_for(
     *,
     duration_seconds: int = 0,
     estimated_tokens: int = 0,
-    content_mode: str = "conversation",
 ) -> int:
     if _prepare_is_quick_mode(lines):
         return 1
@@ -4107,16 +3762,10 @@ def _prepare_chunk_count_for(
         target_chunk_minutes = 20
         chunks_by_duration = max(1, math.ceil(duration_seconds / 60 / target_chunk_minutes))
         chunks = max(chunks, min(chunks_by_duration, chunks_by_lines + 2))
-        if content_mode == "monologue":
-            max_chunks = 2 if duration_seconds <= 30 * 60 else 3 if duration_seconds <= 55 * 60 else 4
-        else:
-            max_chunks = 12 if lines >= 12000 else 10 if lines >= 8000 else 8
+        max_chunks = 12 if lines >= 12000 else 10 if lines >= 8000 else 8
         return min(chunks, max_chunks)
 
-    if content_mode == "monologue":
-        max_chunks = 2 if lines < 2000 else 3
-    else:
-        max_chunks = 12 if lines >= 12000 else 10 if lines >= 8000 else 8
+    max_chunks = 12 if lines >= 12000 else 10 if lines >= 8000 else 8
     return min(chunks, max_chunks)
 
 
@@ -4195,7 +3844,7 @@ def _prepare_build_header_seed(
     }
 
 
-def _prepare_build_chunk_plan(meta: list[FileMeta], speaker_stage: str, *, work_dir: Path, content_mode: str) -> list[dict]:
+def _prepare_build_chunk_plan(meta: list[FileMeta], speaker_stage: str, *, work_dir: Path) -> list[dict]:
     plan: list[dict] = []
     prompt_dir = work_prompt_dir(work_dir)
     global_index = 0
@@ -4208,7 +3857,6 @@ def _prepare_build_chunk_plan(meta: list[FileMeta], speaker_stage: str, *, work_
             speaker_stage,
             duration_seconds=duration_seconds,
             estimated_tokens=file_meta.estimated_tokens,
-            content_mode=content_mode,
         )
         chunk_size = math.ceil(lines / chunks)
         overlap = max(10, min(24, round(chunk_size * 0.08)))
@@ -4270,7 +3918,6 @@ def _prepare_build_chunk_plan(meta: list[FileMeta], speaker_stage: str, *, work_
                         "optional": 1.0,
                         "skip": 1.16,
                     }[speaker_stage]))),
-                    "content_mode": content_mode,
                 }
             )
             global_index += 1
@@ -4347,7 +3994,6 @@ def _prepare_build_report(
     fingerprint: str,
     meta: list[FileMeta],
     speaker_stage: str,
-    content_mode: str,
     speaker_reason: str,
     prescan_limit: int,
     plan: list[dict],
@@ -4367,7 +4013,6 @@ def _prepare_build_report(
         f"Total lines: {total_lines}",
         f"Duration estimate: {duration_estimate}",
         f"Unique speakers: {len(speaker_markers)}",
-        f"Content mode: {content_mode}",
         f"Speaker stage: {speaker_stage} ({speaker_reason})",
         f"Prescan limit: {prescan_limit} lines",
     ]
@@ -4386,10 +4031,7 @@ def _prepare_build_report(
         if chunk["file"] != current_file:
             current_file = chunk["file"]
             file_meta = next(item for item in meta if str(item.path) == current_file)
-            lines.append(
-                f"FILE: {current_file} ({file_meta.lines} lines, "
-                f"{_prepare_chunk_count_for(file_meta.lines, speaker_stage, content_mode=content_mode)} chunks)"
-            )
+            lines.append(f"FILE: {current_file} ({file_meta.lines} lines, {_prepare_chunk_count_for(file_meta.lines, speaker_stage)} chunks)")
             lines.append("")
 
         lines.append(f"  CHUNK {chunk['chunk_id']}:")
@@ -4421,7 +4063,11 @@ def _prepare_dump_json(path: Path, payload: dict) -> None:
 
 
 def execution_mode_for_total_chunks(total_chunks: int) -> str:
-    return execution_mode_for_plan(total_chunks, content_mode="conversation")
+    if total_chunks <= 1:
+        return "single"
+    if total_chunks <= 3:
+        return "micro-multi"
+    return "multi"
 
 
 def _prepare_render_speaker_prompt(work_dir: Path) -> str:
@@ -4469,7 +4115,6 @@ def _prepare_render_extraction_prompt(work_dir: Path, chunk: dict, execution_mod
         f"TARGET TOKENS: {chunk.get('estimated_tokens') or 'unknown'}\n"
         f"CHUNK FINGERPRINT: {chunk['chunk_fingerprint']}\n"
         f"MODE: {execution_mode}\n\n"
-        f"NOTE CONTRACT: {note_contract_path(work_dir)}\n\n"
         "Required outputs:\n"
         f"- $WORK_DIR/chunk_{chunk_id}_block_01.md ... chunk_{chunk_id}_block_NN.md\n"
         f"- $WORK_DIR/manifest_chunk_{chunk_id}.tsv\n"
@@ -4481,9 +4126,8 @@ def _prepare_render_extraction_prompt(work_dir: Path, chunk: dict, execution_mod
         "- Keep Speaker N labels exactly as in transcript.\n"
         "- Do not invent facts, versions, or tools not present in the source.\n"
         "- Extract only from EXTRACTION ZONE; use CONTEXT ZONE only for orientation.\n"
-        "- Split by semantic or chapter boundaries, not by a fixed number of blocks.\n"
-        "- If the chunk is short or semantically narrow, one dense block is valid.\n"
-        "- Do not create blocks shorter than 5 minutes unless the source naturally ends there.\n"
+        "- Split into 2-4 topical blocks when possible; each block should usually cover 6-10 minutes.\n"
+        "- Do not create blocks shorter than 5 minutes unless the chunk is ending.\n"
         "- Each block must be dense and interpretive, not just a sparse paraphrase.\n"
         "- Give each block a conclusion-style title: what the block proves, changes, or clarifies for the reader.\n"
         "- Each block should contain 5-8 theses with italic timestamps *(MM:SS)*.\n"
@@ -4492,7 +4136,7 @@ def _prepare_render_extraction_prompt(work_dir: Path, chunk: dict, execution_mod
         "- Add a short case section only when an example carries a distinct lesson beyond the theses.\n"
         "- Add a short dialogue section only when the exchange reveals something non-obvious that is lost in plain theses.\n"
         "- Include at most one memorable verbatim quote per block, only if it is genuinely sharp or revealing.\n"
-        "- `### Смысл блока` is optional and should be one short line only when the block has a clear practical implication.\n"
+        "- Every block must end with a practical meaning section: 2-4 bullets explaining what this changes in practice.\n"
         "- Write exactly one summary_chunk file with 5-7 numbered key ideas from this chunk.\n\n"
         "Each block file should use this structure:\n"
         "---\n"
@@ -4516,20 +4160,14 @@ def _prepare_render_extraction_prompt(work_dir: Path, chunk: dict, execution_mod
         "[omit this whole section if no meaningful dialogue]\n\n"
         "> *«Verbatim quote preserving exact language»* — [timestamp]\n"
         "[max 1 per block]\n\n"
-        "### Смысл блока:\n"
-        "...\n"
-        "[optional: one short line only if the practical implication is genuinely clear]\n\n"
+        "### Практический смысл:\n"
+        "- ...\n"
+        "- ...\n"
+        "[2-4 concise bullets about what this changes for the reader in practice]\n\n"
         "Manifest format:\n"
-        "First line = header: block_file\\ttimestamp_start\\ttimestamp_end\\ttopic\\tprimary_claim\\tnames\\tresources\\tcase_title\\thas_dialogue\\tquote_text\\taction_now\\taction_check\\taction_avoid\\tquotes_count\\tcases\n"
-        "- `primary_claim`: the single strongest idea of the block in one sentence.\n"
+        "First line = header: block_file\\ttimestamp_start\\ttimestamp_end\\ttopic\\tnames\\tresources\\tquotes_count\\tcases\n"
         "- `names`: people explicitly mentioned in the block, including Speaker N labels if real names are still unknown.\n"
         "- `resources`: books, tools, platforms, apps, services mentioned.\n"
-        "- `case_title`: short case/example label or empty string.\n"
-        "- `has_dialogue`: 1 if a dialogue section is present, else 0.\n"
-        "- `quote_text`: the memorable quote text without markdown, or empty string.\n"
-        "- `action_now`: reader-facing imperative action to try immediately, or empty string.\n"
-        "- `action_check`: reader-facing diagnostic/check question for the next week, or empty string.\n"
-        "- `action_avoid`: one trap/pitfall to avoid on an ongoing basis, or empty string.\n"
         "- `cases`: 1 if a real case/example section was included, else 0.\n\n"
         "After writing all files, write the sentinel JSON with fields:\n"
         "{\n"
@@ -4548,14 +4186,11 @@ def _prepare_render_extraction_prompt(work_dir: Path, chunk: dict, execution_mod
 def _prepare_render_tldr_prompt(work_dir: Path) -> str:
     sentinel_path = stage_sentinel_path(work_dir, "tldr")
     return (
-        "Read all summary_chunk_*.md files in $WORK_DIR (sorted), plus the note contract and block manifests.\n\n"
+        "Read all summary_chunk_*.md files in $WORK_DIR (sorted) and write $WORK_DIR/tldr.md.\n\n"
         f"WORK_DIR: {work_dir}\n"
-        f"NOTE CONTRACT: {note_contract_path(work_dir)}\n"
         f"SENTINEL: {sentinel_path}\n\n"
         "Output only a numbered list of key takeaways in Russian.\n"
-        "Use the contract bounds for the number of bullets.\n"
-        "Deduplicate near-identical points aggressively.\n"
-        "Use only information from summary files and manifests. Do not invent.\n\n"
+        "Use only information from summary files. Do not invent.\n\n"
         "After writing tldr.md, write the sentinel JSON with fields:\n"
         '{\n'
         '  "stage": "tldr",\n'
@@ -4568,43 +4203,21 @@ def _prepare_render_tldr_prompt(work_dir: Path) -> str:
 
 
 def _prepare_render_header_prompt(work_dir: Path) -> str:
-    header_seed = load_json_if_exists(work_dir / HEADER_SEED_FILENAME) or {}
-    note_contract = load_json_if_exists(note_contract_path(work_dir)) or {}
-    source_identity = header_seed.get("source_identity") if isinstance(header_seed.get("source_identity"), dict) else {}
-    topic_hint = _cleanup_title_text(str(header_seed.get("topic_hint") or ""))
-    duration_hint = str(header_seed.get("duration_estimate") or "unknown").strip() or "unknown"
-    author_hint = _cleanup_person_hint(str(header_seed.get("author_hint") or ""))
-    format_label = str((note_contract.get("header") or {}).get("format_label") or format_label_for_content_mode("conversation"))
-    youtube_meta = source_identity.get("youtube") if isinstance(source_identity.get("youtube"), dict) else {}
-    video_id = str(youtube_meta.get("video_id") or "").strip()
-    source_label = f"https://www.youtube.com/watch?v={video_id}" if video_id else ", ".join(
-        [str(item).strip() for item in header_seed.get("source_files", []) if isinstance(item, str) and str(item).strip()]
-    ) or "локальный источник"
-    metadata_lines: list[str] = []
-    if _is_informative_person_hint(author_hint):
-        metadata_lines.append(f"**Автор:** {author_hint}")
-    metadata_lines.append(f"**Формат:** {format_label}")
-    metadata_lines.append(f"**Тема:** {topic_hint or 'Сформулируй по содержанию'}")
-    metadata_lines.append(f"**Длительность:** {duration_hint}")
-    metadata_lines.append(f"**Источник:** {source_label}")
-    metadata_block = "\n".join(metadata_lines)
     return (
-        f"Read {work_dir / HEADER_SEED_FILENAME}, {note_contract_path(work_dir)} and {work_dir / 'tldr.md'} if it exists.\n"
-        f"Use {work_dir / 'prescan_context.txt'} only as a fallback for disambiguation.\n"
-        f"Write {work_dir / 'header.md'} using the header seed, note contract and TL;DR.\n"
+        f"Read {work_dir / HEADER_SEED_FILENAME} and {work_dir / 'prescan_context.txt'}.\n"
+        f"Write {work_dir / 'header.md'} using the header seed and the transcript context.\n"
         "Prefer the best content title candidate, not the raw source title.\n"
         "If header-seed.json contains author_hint and this is a single-speaker YouTube monologue, use that real name in the title instead of generic labels.\n\n"
-        "Write deterministic metadata exactly as provided below, and generate only the abstract plus the three author-frame bullets.\n\n"
-        "Metadata block to preserve:\n"
-        f"{metadata_block}\n\n"
         "Output format:\n"
         "# [Content-based title]\n\n"
         "> [2-3 sentence content summary in Russian]\n\n"
-        f"{metadata_block}\n\n"
+        "**Автор:** [real person if known, otherwise omit this line]\n"
+        "**Формат:** [лекция / интервью / разбор / воркшоп / групповая сессия]\n"
+        "**Тема:** [one-line core topic]\n"
+        "**Длительность:** [duration estimate]\n"
+        "**Источник:** [YouTube link or source label]\n\n"
         "## Главная рамка автора\n"
-        "- [core belief]\n"
-        "- [what the author pushes against]\n"
-        "- [practical frame for the reader]\n"
+        "[One short paragraph in Russian explaining the author's core lens: what they think matters most, what they push against, and what practical frame they offer.]\n"
     )
 
 
@@ -4624,8 +4237,6 @@ def _prepare_write_prompt_packs(
         "dir": str(prompt_dir),
         "stage_dir": str(stage_dir),
         "header_seed": str(work_dir / HEADER_SEED_FILENAME),
-        "note_contract": str(note_contract_path(work_dir)),
-        "quality_checks": str(quality_checks_path(work_dir)),
         "header": str(prompt_dir / "header.md"),
         "speaker_identification": None,
         "tldr_agent": None,
@@ -4683,12 +4294,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
     work_dir.mkdir(parents=True, exist_ok=True)
 
     speaker_stage, speaker_reason = _prepare_classify_speaker_stage(meta)
-    speaker_stage, speaker_reason, content_mode, content_reason = _prepare_effective_speaker_stage(
-        meta,
-        speaker_stage,
-        speaker_reason,
-        source_hints=source_hints,
-    )
     prescan_limit = _prepare_choose_prescan_limit(speaker_stage)
     # --- Load chapter markers from source bundle if available ---
     chapters_loaded: list[dict] = []
@@ -4702,13 +4307,8 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
                 pass
             break
 
-    total_duration_seconds = total_duration_seconds_for_meta(meta)
-    plan = _prepare_build_chunk_plan(meta, speaker_stage, work_dir=work_dir, content_mode=content_mode)
-    execution_mode = execution_mode_for_plan(
-        len(plan),
-        content_mode=content_mode,
-        duration_seconds=total_duration_seconds,
-    )
+    plan = _prepare_build_chunk_plan(meta, speaker_stage, work_dir=work_dir)
+    execution_mode = execution_mode_for_total_chunks(len(plan))
     prescan_context = _prepare_build_prescan_context(meta, speaker_stage, prescan_limit, source_hints=source_hints)
     header_seed = _prepare_build_header_seed(
         meta,
@@ -4716,15 +4316,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
         chapters_loaded=chapters_loaded,
         source_hints=source_hints,
     )
-    note_contract = build_note_contract(
-        work_dir=work_dir,
-        content_mode=content_mode,
-        execution_mode=execution_mode,
-        header_seed=header_seed,
-        total_chunks=len(plan),
-        duration_seconds=total_duration_seconds,
-    )
-    _prepare_dump_json(note_contract_path(work_dir), note_contract)
     prompt_packs = _prepare_write_prompt_packs(
         work_dir,
         plan,
@@ -4732,22 +4323,11 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
         execution_mode=execution_mode,
         header_seed=header_seed,
     )
-    prepare_quality_checks = build_prepare_quality_checks(
-        content_mode=content_mode,
-        execution_mode=execution_mode,
-        speaker_stage=speaker_stage,
-        content_reason=content_reason,
-        note_contract=note_contract,
-        meta=meta,
-        plan=plan,
-        source_hints=source_hints,
-    )
     report = _prepare_build_report(
         work_dir=work_dir,
         fingerprint=fingerprint,
         meta=meta,
         speaker_stage=speaker_stage,
-        content_mode=content_mode,
         speaker_reason=speaker_reason,
         prescan_limit=prescan_limit,
         plan=plan,
@@ -4769,8 +4349,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
         "duration_estimate": next((item.duration_estimate for item in reversed(meta) if item.duration_estimate), "unknown"),
         "speaker_stage": speaker_stage,
         "speaker_stage_reason": speaker_reason,
-        "content_mode": content_mode,
-        "content_mode_reason": content_reason,
         "speaker_stage_skippable": speaker_stage == "skip",
         "prescan_limit": prescan_limit,
         "execution_mode": execution_mode,
@@ -4794,7 +4372,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
                 "estimated_tokens": item.estimated_tokens,
                 "markers": item.markers,
                 "dialogue_cues": item.dialogue_cues,
-                "dialogue_speakers": item.dialogue_speakers,
                 "intro_cues": item.intro_cues,
                 "duration_estimate": item.duration_estimate,
             }
@@ -4806,7 +4383,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
             "chunks": len(plan),
             "estimated_tokens": sum(item.estimated_tokens for item in meta),
             "speaker_markers": sum(item.markers for item in meta),
-            "dialogue_speakers": sum(item.dialogue_speakers for item in meta),
         },
         "artifacts": {
             "report": str(work_dir / "prepare_report.txt"),
@@ -4816,18 +4392,13 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
             "prompt_pack_dir": str(work_prompt_dir(work_dir)),
             "stage_dir": str(work_stage_dir(work_dir)),
             "header_seed": str(work_dir / HEADER_SEED_FILENAME),
-            "note_contract": str(note_contract_path(work_dir)),
-            "quality_checks": str(quality_checks_path(work_dir)),
         },
         "chunk_plan": plan,
         "prompt_packs": prompt_packs,
         "header_seed": header_seed,
         "source_identity": source_hints if isinstance(source_hints, dict) else {},
-        "note_contract": note_contract,
-        "quality_checks": prepare_quality_checks,
         "telemetry": {
             "prepare_duration_ms": prepare_duration_ms,
-            "duration_seconds": total_duration_seconds,
         },
     }
 
@@ -4838,8 +4409,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
         "quick_mode": quick_mode,
         "speaker_stage": speaker_stage,
         "speaker_stage_reason": speaker_reason,
-        "content_mode": content_mode,
-        "content_mode_reason": content_reason,
         "execution_mode": execution_mode,
         "chunking": {
             "strategy": "single-chunk" if quick_mode else "adaptive-line-token-budget",
@@ -4849,11 +4418,8 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
         "prompt_packs": prompt_packs,
         "header_seed": header_seed,
         "source_identity": source_hints if isinstance(source_hints, dict) else {},
-        "note_contract": note_contract,
-        "quality_checks": prepare_quality_checks,
         "telemetry": {
             "prepare_duration_ms": prepare_duration_ms,
-            "duration_seconds": total_duration_seconds,
         },
     }
 
@@ -4863,7 +4429,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
                 item.lines,
                 speaker_stage,
                 estimated_tokens=item.estimated_tokens,
-                content_mode=content_mode,
             )
             for item in meta
         ]
@@ -4880,7 +4445,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
 
     _prepare_dump_json(work_dir / "prepare_state.json", state_payload)
     _prepare_dump_json(work_dir / "prepare_plan.json", plan_payload)
-    _prepare_dump_json(quality_checks_path(work_dir), prepare_quality_checks)
     (work_dir / "prescan_context.txt").write_text(prescan_context, encoding="utf-8")
     (work_dir / "prepare_report.txt").write_text(report, encoding="utf-8")
     write_stage_sentinel(
@@ -4889,7 +4453,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
             "stage": "prepare",
             "work_dir": str(work_dir),
             "fingerprint": fingerprint,
-            "content_mode": content_mode,
             "execution_mode": execution_mode,
             "completed": True,
             "completed_at": datetime.now().isoformat(),
@@ -4902,8 +4465,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
         "fingerprint": fingerprint,
         "speaker_stage": speaker_stage,
         "speaker_stage_reason": speaker_reason,
-        "content_mode": content_mode,
-        "content_mode_reason": content_reason,
         "files": len(meta),
         "total_lines": sum(item.lines for item in meta),
         "total_chunks": len(plan),
@@ -4914,8 +4475,6 @@ def run_prepare_logic(input_files: list[Path], *, source_hints: dict | None = No
         "prescan_context_path": str(work_dir / "prescan_context.txt"),
         "prompt_pack_dir": str(work_prompt_dir(work_dir)),
         "header_seed_path": str(work_dir / HEADER_SEED_FILENAME),
-        "note_contract_path": str(note_contract_path(work_dir)),
-        "quality_checks_path": str(quality_checks_path(work_dir)),
         "prepare_duration_ms": prepare_duration_ms,
     }
 
@@ -4952,7 +4511,6 @@ def build_status(work_dir: Path) -> dict:
         "work_dir": str(work_dir),
         "fingerprint": prepare_payload.get("fingerprint"),
         "execution_mode": prepare_payload.get("execution_mode"),
-        "content_mode": prepare_payload.get("content_mode"),
         "chunk_plan": chunk_plan,
         "chunk_statuses": chunk_statuses,
         "stage_hints": prepare_payload.get("stage_hints", {}),
@@ -4960,8 +4518,6 @@ def build_status(work_dir: Path) -> dict:
         "stages": stages,
         "prompt_packs": prepare_payload.get("prompt_packs", {}),
         "header_seed": prepare_payload.get("header_seed", {}),
-        "note_contract": prepare_payload.get("note_contract", {}),
-        "quality_checks": prepare_payload.get("quality_checks", {}),
         "title_candidates": prepare_payload.get("title_candidates", []),
         "telemetry": prepare_payload.get("telemetry", {}),
         "next_action": determine_next_action(stages),
@@ -4982,8 +4538,6 @@ def build_status(work_dir: Path) -> dict:
             "merged_manifest": (work_dir / "manifest.tsv").exists(),
             "prompt_pack_dir": work_prompt_dir(work_dir).is_dir(),
             "stage_dir": work_stage_dir(work_dir).is_dir(),
-            "note_contract": note_contract_path(work_dir).is_file(),
-            "quality_checks": quality_checks_path(work_dir).is_file(),
         },
     }
     payload["execution_plan"] = build_execution_plan(prepare_payload, chunk_statuses, stages)
@@ -5026,27 +4580,17 @@ def read_summary_points(summary_path: Path) -> list[str]:
     return fallback[:7]
 
 
-def target_tldr_count(summary_files: list[Path], *, prepare_payload: dict | None = None) -> int:
-    prepare_payload = prepare_payload or {}
-    note_contract = prepare_payload.get("note_contract") if isinstance(prepare_payload.get("note_contract"), dict) else {}
-    if isinstance(note_contract.get("tldr"), dict):
-        min_items = int(note_contract["tldr"].get("min_items") or 0)
-        max_items = int(note_contract["tldr"].get("max_items") or 0)
-        if min_items and max_items:
-            if len(summary_files) <= min_items:
-                return min_items
-            return max(min_items, min(max_items, len(summary_files) * 2))
-
+def target_tldr_count(summary_files: list[Path]) -> int:
     count = len(summary_files)
     if count <= 1:
         return 5
     if count == 2:
-        return 7
-    if count == 3:
         return 8
+    if count == 3:
+        return 10
     if count == 4:
-        return 9
-    return 10
+        return 12
+    return 15
 
 
 def build_tldr_deterministically(work_dir: Path) -> dict:
@@ -5054,9 +4598,8 @@ def build_tldr_deterministically(work_dir: Path) -> dict:
     if not summary_files:
         raise FileNotFoundError(f"No summary_chunk_*.md files found in {work_dir}")
 
-    prepare_payload = load_prepare_payload(work_dir)
     per_file_points = [read_summary_points(path) for path in summary_files]
-    target_count = target_tldr_count(summary_files, prepare_payload=prepare_payload)
+    target_count = target_tldr_count(summary_files)
     chosen: list[str] = []
     seen: set[str] = set()
     offset = 0
@@ -5087,6 +4630,7 @@ def build_tldr_deterministically(work_dir: Path) -> dict:
         "\n".join(f"{index}. {point}" for index, point in enumerate(chosen, start=1)) + "\n",
     )
 
+    prepare_payload = load_prepare_payload(work_dir)
     sentinel_path = stage_sentinel_path(work_dir, "tldr")
     write_stage_sentinel(
         sentinel_path,
@@ -5147,11 +4691,6 @@ REPLACE_SPEAKERS_TARGET_PATTERNS = (
     "manifest_chunk_*.tsv",
     "summary_chunk_*.md",
     "tldr.md",
-)
-HEADER_METADATA_LABELS = ("Автор", "Формат", "Тема", "Длительность", "Источник")
-ACTION_VERB_RE = re.compile(
-    r"^(?:сделай|проверь|зафиксируй|запиши|определи|выбери|сравни|найди|ответь|сформулируй|вернись|ограничь|убери|избегай|попробуй|скажи|спроси|не\b)",
-    re.IGNORECASE,
 )
 
 
@@ -5236,493 +4775,10 @@ def cmd_replace_speakers(args: argparse.Namespace) -> int:
     return 0
 
 
-def merge_manifest_parts(work_dir: Path) -> Path | None:
-    manifest_parts = sorted(work_dir.glob("manifest_chunk_*.tsv"))
-    merged_path = work_dir / "manifest.tsv"
-    if not manifest_parts:
-        return merged_path if merged_path.is_file() else None
-    lines = manifest_parts[0].read_text(encoding="utf-8", errors="replace").splitlines()[:1]
-    for part in manifest_parts:
-        part_lines = part.read_text(encoding="utf-8", errors="replace").splitlines()
-        if part_lines:
-            lines.extend(part_lines[1:])
-    write_text(merged_path, "\n".join(lines).rstrip() + "\n")
-    return merged_path
-
-
-def _split_manifest_values(value: str) -> list[str]:
-    items = re.split(r"[;|,]\s*", value or "")
-    return [item.strip() for item in items if item.strip() and item.strip() not in {"—", "-", "–"}]
-
-
-def _normalize_statement(value: str) -> str:
-    text = re.sub(r"\s+", " ", (value or "").strip())
-    text = re.sub(r"^\*\*[^*]+\*\*\s*:?\s*", "", text)
-    text = re.sub(r"^[—–-]\s*", "", text)
-    text = re.sub(r"\s*\*\([^)]+\)\*\s*$", "", text)
-    return text.rstrip(".").strip()
-
-
-def _limit_text(value: str, limit: int = 140) -> str:
-    text = re.sub(r"\s+", " ", (value or "").strip())
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
-
-
-def _topic_tokens(value: str) -> list[str]:
-    return [
-        token
-        for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", value.lower())
-        if len(token) >= 4 and token not in {"этого", "этими", "почему", "через", "когда", "после", "теория", "вопрос", "совет", "автора"}
-    ]
-
-
-def _extract_people_from_text(text: str) -> list[str]:
-    candidates: list[str] = []
-    for match in re.findall(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}|[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+){1,2})\b", text or ""):
-        name = re.sub(r"\s+", " ", match.strip())
-        if len(name) >= 4:
-            candidates.append(name)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = candidate.casefold()
-        if key in seen:
-            continue
-        deduped.append(candidate)
-        seen.add(key)
-    return deduped
-
-
-def _is_placeholder_entity(value: str) -> bool:
-    text = re.sub(r"\s+", " ", (value or "").strip())
-    if not text or text in {"—", "-", "–"}:
-        return True
-    if text.casefold() in {"unknown", "speaker", "author", "creator", "uploader"}:
-        return True
-    if re.fullmatch(r"speaker\s+\d+", text, flags=re.IGNORECASE):
-        return True
-    return False
-
-
-def _prepare_action_candidate_text(value: str) -> str:
-    text = _normalize_statement(value)
-    if not text:
-        return ""
-    if ":" in text:
-        prefix, suffix = text.split(":", 1)
-        prefix_lower = prefix.lower()
-        if any(marker in prefix_lower for marker in ("вопрос", "метод", "совет", "критерий", "практик", "диагност", "вывод", "предупреждение")):
-            suffix = re.sub(r"\s+", " ", suffix.strip().strip("«»\""))
-            if suffix:
-                text = suffix
-    return text.strip().strip("«»\"").rstrip(".")
-
-
-def _imperative_action_text(value: str) -> str:
-    text = _prepare_action_candidate_text(value)
-    if not text:
-        return ""
-    first = text.split(" ", 1)[0].strip("«»\".,:;!?").casefold()
-    if re.match(r"^(сделай|проверь|зафиксируй|запиши|определи|выбери|сравни|найди|ответь|сформулируй|вернись|ограничь|убери|избегай|попробуй|скажи|спроси|не)$", first):
-        return text
-    lowered = text.casefold()
-    for token, prefix in (
-        ("перв", "Зафиксируй "),
-        ("вопрос", "Ответь себе на вопрос: "),
-        ("мысл", "Запиши мысль: "),
-        ("страх", "Проверь страх: "),
-        ("роль", "Определи роль: "),
-        ("блокир", "Найди блокирующую мысль: "),
-    ):
-        if token in lowered:
-            return prefix + text[0].lower() + text[1:] if text else ""
-    return text
-
-
-def _score_action_candidate(text: str) -> int:
-    lowered = text.lower()
-    score = 0
-    strong_positive = (
-        "сегодня", "завтра", "прямо сейчас", "немедлен", "сделай", "проверь", "зафиксируй", "запиши",
-        "определи", "выбери", "ответь", "найди", "сформулируй", "вернись", "ограничь", "убери",
-        "избегай", "попробуй", "зафиксир", "представь", "скажи себе", "сделать", "делать только это",
-        "не сопротивля", "не бойся", "чернов", "первую мысль",
-    )
-    positive = ("вопрос", "упражнен", "метод", "практик", "начать", "действовать", "действуй", "вспомни", "живого контакта", "не пуг", "возвращ")
-    negative = ("соответствует понятию", "нейробиологический факт", "не метафора", "моделирование", "механическая система", "теория", "опровергнута исследованиями", "диагностический инструмент")
-    score += sum(2 for token in strong_positive if token in lowered)
-    score += sum(1 for token in positive if token in lowered)
-    score -= sum(2 for token in negative if token in lowered)
-    if "?" in text or "«" in text:
-        score += 1
-    if len(text) > 220:
-        score -= 1
-    return score
-
-
-def _classify_action_bucket(text: str) -> str | None:
-    lowered = text.lower()
-    if _score_action_candidate(text) < 2:
-        return None
-    if any(token in lowered for token in ("сегодня", "завтра", "прямо сейчас", "немедлен", "чернов", "зафиксир", "скажи себе", "представь", "сделать", "делать только это")):
-        return "immediate"
-    if lowered.startswith(("сделай", "проверь", "зафиксируй", "запиши", "определи", "выбери", "ответь", "найди", "сформулируй")):
-        return "immediate"
-    if any(token in lowered for token in ("не сопротивля", "не бойся", "не пуг", "живого контакта", "возвращ", "не смиря")):
-        return "ongoing"
-    if lowered.startswith(("не ", "избегай", "вернись")):
-        return "ongoing"
-    return "month"
-
-
-def build_deterministic_appendix(work_dir: Path) -> Path:
-    appendix_path = work_dir / "appendix.md"
-    manifest_paths = sorted(work_dir.glob("manifest_chunk_*.tsv"))
-    summary_paths = sorted(work_dir.glob("summary_chunk_*.md"))
-    block_paths = sorted(work_dir.glob("chunk_*_block_*.md"))
-    source_paths = manifest_paths + summary_paths + block_paths + [work_dir / HEADER_SEED_FILENAME]
-    if appendix_path.is_file():
-        appendix_mtime = appendix_path.stat().st_mtime
-        newest_source = max((path.stat().st_mtime for path in source_paths if path.is_file()), default=0)
-        if newest_source <= appendix_mtime:
-            return appendix_path
-    header_seed = load_json_if_exists(work_dir / HEADER_SEED_FILENAME) or {}
-
-    name_contexts: dict[str, set[str]] = defaultdict(set)
-    resource_contexts: dict[str, set[str]] = defaultdict(set)
-    topic_counter: Counter[str] = Counter()
-    topic_descriptions: dict[str, list[str]] = defaultdict(list)
-    block_candidate_actions: list[str] = []
-    manifest_action_now: list[str] = []
-    manifest_action_check: list[str] = []
-    manifest_action_avoid: list[str] = []
-
-    author_hint = re.sub(r"\s+", " ", str(header_seed.get("author_hint") or "").strip())
-    speaker_candidates = [
-        re.sub(r"\s+", " ", str(item).strip())
-        for item in header_seed.get("speaker_candidates", [])
-        if isinstance(item, str) and str(item).strip()
-    ]
-    if author_hint and not _is_placeholder_entity(author_hint):
-        name_contexts[author_hint].add("YouTube-автор / вероятный основной спикер")
-    for candidate in speaker_candidates:
-        if candidate != author_hint and not _is_placeholder_entity(candidate):
-            name_contexts[candidate].add("Имя из metadata источника")
-
-    for manifest_path in manifest_paths:
-        with manifest_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
-            reader = csv.DictReader(fh, delimiter="\t")
-            for row in reader:
-                topic = re.sub(r"\s+", " ", (row.get("topic", "") or row.get("title", "")).strip())
-                block_file = re.sub(r"\s+", " ", (row.get("block_file", manifest_path.stem)).strip())
-                if topic:
-                    topic_counter[topic] += 1
-                primary_claim = _normalize_statement(row.get("primary_claim", ""))
-                if topic and primary_claim and len(topic_descriptions[topic]) < 4:
-                    topic_descriptions[topic].append(primary_claim)
-                for name in _split_manifest_values(row.get("names", "")):
-                    if not _is_placeholder_entity(name):
-                        name_contexts[name].add(topic or block_file)
-                for resource in _split_manifest_values(row.get("resources", "")):
-                    if not _is_placeholder_entity(resource):
-                        resource_contexts[resource].add(topic or block_file)
-                case_title = re.sub(r"\s+", " ", (row.get("case_title", "") or "").strip())
-                if topic and case_title and len(topic_descriptions[topic]) < 4:
-                    topic_descriptions[topic].append(f"Кейс: {case_title}")
-                for candidate, bucket in (
-                    (row.get("action_now", ""), manifest_action_now),
-                    (row.get("action_check", ""), manifest_action_check),
-                    (row.get("action_avoid", ""), manifest_action_avoid),
-                ):
-                    prepared = _imperative_action_text(candidate or "")
-                    if prepared:
-                        bucket.append(prepared)
-
-    summary_lines: list[str] = []
-    for summary_path in summary_paths:
-        summary_lines.extend([_normalize_statement(line) for line in read_summary_points(summary_path)])
-
-    for block_path in block_paths:
-        block_topic = ""
-        block_topic_recorded = False
-        in_theses = False
-        for raw_line in read_text_file(block_path).splitlines():
-            line = raw_line.rstrip()
-            heading_match = re.match(r"^\s*#\s*Блок\s+\d+\s*:\s*(.+)$", line)
-            if heading_match and not block_topic:
-                block_topic = re.sub(r"\s+", " ", heading_match.group(1).strip())
-            subheading_match = re.match(r"^\s*##\s+(.+?)(?:\s+\([0-9:–-]+\))?\s*$", line)
-            if subheading_match and not block_topic:
-                block_topic = re.sub(r"\s+", " ", subheading_match.group(1).strip())
-            if block_topic and not block_topic_recorded:
-                topic_counter[block_topic] += 1
-                block_topic_recorded = True
-            if re.match(r"^\s*###\s+Тезисы", line):
-                in_theses = True
-                continue
-            if re.match(r"^\s*###\s+", line):
-                in_theses = False
-            thesis_match = re.match(r"^\s*\d+\.\s+(.+)$", line)
-            bullet_match = re.match(r"^\s*[-*]\s*(?:\*\([^)]+\)\*\s*)?(.+)$", line)
-            verdict_match = re.match(r"^\s*\*\*Вывод:\*\*\s*(.+)$", line)
-            candidate = ""
-            if in_theses and thesis_match:
-                candidate = thesis_match.group(1)
-            elif bullet_match and re.search(r"\*\([^)]+\)\*", line):
-                candidate = bullet_match.group(1)
-            elif verdict_match:
-                candidate = verdict_match.group(1)
-            if candidate:
-                statement = _normalize_statement(candidate)
-                if statement:
-                    block_candidate_actions.append(statement)
-                    if block_topic and len(topic_descriptions[block_topic]) < 4:
-                        topic_descriptions[block_topic].append(statement)
-                    for person in _extract_people_from_text(statement):
-                        if not _is_placeholder_entity(person):
-                            name_contexts[person].add(block_topic or block_path.name)
-
-    actions = {"immediate": [], "month": [], "ongoing": []}
-    seen_actions: set[str] = set()
-
-    def append_direct(bucket_name: str, lines: list[str]) -> None:
-        for line in lines:
-            prepared = _imperative_action_text(line)
-            if not prepared:
-                continue
-            key = prepared.casefold()
-            if key in seen_actions:
-                continue
-            actions[bucket_name].append(prepared)
-            seen_actions.add(key)
-
-    def append_scored(lines: list[str], min_score: int) -> None:
-        for line in lines:
-            prepared = _prepare_action_candidate_text(line)
-            if not prepared:
-                continue
-            if _score_action_candidate(prepared) < min_score:
-                continue
-            bucket = _classify_action_bucket(prepared)
-            if not bucket:
-                continue
-            key = prepared.casefold()
-            if key in seen_actions:
-                continue
-            actions[bucket].append(prepared)
-            seen_actions.add(key)
-
-    append_direct("immediate", manifest_action_now)
-    append_direct("month", manifest_action_check)
-    append_direct("ongoing", manifest_action_avoid)
-    append_scored(block_candidate_actions, 2)
-    if sum(len(items) for items in actions.values()) < 5:
-        append_scored(summary_lines, 3)
-
-    def best_topic_description(topic: str) -> str:
-        candidates = topic_descriptions.get(topic) or []
-        if candidates:
-            return _limit_text(candidates[0], limit=180)
-        topic_words = set(_topic_tokens(topic))
-        best_line = ""
-        best_score = 0
-        for line in summary_lines:
-            line_words = set(_topic_tokens(line))
-            score = len(topic_words & line_words)
-            if score > best_score:
-                best_line = line
-                best_score = score
-        return _limit_text(best_line, limit=180) if best_line else "Ключевая идея проходит через несколько частей конспекта."
-
-    appendix_lines: list[str] = ["# Упомянутые люди и ресурсы"]
-    if name_contexts or resource_contexts:
-        appendix_lines.extend(["", "## Люди"])
-        if name_contexts:
-            for name in sorted(name_contexts):
-                contexts = sorted(name_contexts[name])
-                appendix_lines.append(f"- **{name}:** {_limit_text('; '.join(contexts[:2]))}.")
-        else:
-            appendix_lines.append("- Явно названные люди не были извлечены из материалов.")
-        appendix_lines.extend(["", "## Ресурсы"])
-        if resource_contexts:
-            for resource in sorted(resource_contexts):
-                contexts = sorted(resource_contexts[resource])
-                appendix_lines.append(f"- **{resource}:** {_limit_text('; '.join(contexts[:2]))}.")
-        else:
-            appendix_lines.append("- Явно названные книги, инструменты или сервисы не были извлечены из материалов.")
-    else:
-        appendix_lines.extend(["", "- Имена и ресурсы не были явно извлечены из материалов."])
-
-    if any(actions.values()):
-        appendix_lines.extend(["", "---", "", "# План действий", "", "### Прямо сейчас"])
-        for item in actions["immediate"][:5]:
-            appendix_lines.append(f"- [ ] {item}")
-        if actions["month"]:
-            appendix_lines.extend(["", "### На этой неделе"])
-            for item in actions["month"][:5]:
-                appendix_lines.append(f"- [ ] {item}")
-        if actions["ongoing"]:
-            appendix_lines.extend(["", "### На постоянной основе"])
-            for item in actions["ongoing"][:6]:
-                appendix_lines.append(f"- [ ] {item}")
-
-    appendix_lines.extend(["", "---", "", "# Ключевые идеи и модели"])
-    if topic_counter:
-        for topic, _count in topic_counter.most_common(8):
-            appendix_lines.append(f"- **{_limit_text(topic)}:** {best_topic_description(topic)}")
-    else:
-        appendix_lines.append("- Явные модели и повторяющиеся идеи не были извлечены из материалов.")
-
-    write_text(appendix_path, "\n".join(appendix_lines).rstrip() + "\n")
-    return appendix_path
-
-
-def cmd_ensure_appendix(args: argparse.Namespace) -> int:
-    work_dir = ensure_dir(Path(args.work_dir), "Work directory")
-    merged_manifest = merge_manifest_parts(work_dir)
-    appendix_path = build_deterministic_appendix(work_dir)
-    payload = {
-        "work_dir": str(work_dir),
-        "appendix_path": str(appendix_path),
-        "manifest_path": str(merged_manifest) if merged_manifest else None,
-        "generated": True,
-    }
-    if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
-    print(appendix_path)
-    return 0
-
-
-def _extract_checklist_actions(text: str) -> list[str]:
-    actions: list[str] = []
-    for line in text.splitlines():
-        match = re.match(r"^\s*-\s+\[[ xX]\]\s+(.+?)\s*$", line)
-        if match:
-            action = re.sub(r"\s+", " ", match.group(1)).strip()
-            if action:
-                actions.append(action)
-    return actions
-
-
-def compute_final_quality_checks(work_dir: Path, output_md: Path) -> dict:
-    note_contract = load_json_if_exists(note_contract_path(work_dir)) or {}
-    quality = load_json_if_exists(quality_checks_path(work_dir)) or {
-        "schema_version": 1,
-        "content_mode": note_contract.get("content_mode") or "conversation",
-        "prepare": {},
-        "final": {},
-    }
-
-    text = read_text_file(output_md)
-    required_metadata = [
-        str(item).strip()
-        for item in (note_contract.get("header") or {}).get("required_metadata", [])
-        if isinstance(item, str) and str(item).strip()
-    ]
-    if not required_metadata:
-        required_metadata = list(HEADER_METADATA_LABELS)
-
-    header_complete = bool(re.search(r"^\s*#\s+\S", text, flags=re.MULTILINE)) and bool(
-        re.search(r"^\s*>\s+\S", text, flags=re.MULTILINE)
-    )
-    missing_header_fields: list[str] = []
-    for field in required_metadata:
-        if not re.search(rf"^\*\*{re.escape(field)}:\*\*\s+\S", text, flags=re.MULTILINE):
-            header_complete = False
-            missing_header_fields.append(field)
-    if not re.search(r"^##\s+Главная рамка автора\s*$", text, flags=re.MULTILINE):
-        header_complete = False
-        missing_header_fields.append("Главная рамка автора")
-
-    tldr_lines = read_summary_points(work_dir / "tldr.md") if (work_dir / "tldr.md").is_file() else []
-    tldr_contract = note_contract.get("tldr") if isinstance(note_contract.get("tldr"), dict) else {}
-    tldr_min = int(tldr_contract.get("min_items") or 0)
-    tldr_max = int(tldr_contract.get("max_items") or 0)
-    tldr_length_ok = not tldr_lines or (tldr_min <= len(tldr_lines) <= tldr_max if tldr_min and tldr_max else True)
-
-    placeholder_hits: list[str] = []
-    if re.search(r"\bSpeaker\s+\d+\b", text):
-        placeholder_hits.append("Speaker N")
-    if re.search(r"^\s*-\s+\*\*[—-]\*\*", text, flags=re.MULTILINE):
-        placeholder_hits.append("—")
-    if re.search(r"\bunknown\b", text, flags=re.IGNORECASE):
-        placeholder_hits.append("unknown")
-
-    case_titles = [
-        re.sub(r"\s+", " ", match.group(1)).strip().casefold()
-        for match in re.finditer(r"^###\s+Кейс:\s*(.+?)\s*$", text, flags=re.MULTILINE)
-        if re.sub(r"\s+", " ", match.group(1)).strip()
-    ]
-    seen_case_titles: set[str] = set()
-    duplicate_case_titles: list[str] = []
-    for title in case_titles:
-        if title in seen_case_titles and title not in duplicate_case_titles:
-            duplicate_case_titles.append(title)
-        seen_case_titles.add(title)
-
-    actions = _extract_checklist_actions(text)
-    verbish_actions = sum(1 for item in actions if ACTION_VERB_RE.match(item))
-    actionability_ratio = round(verbish_actions / len(actions), 2) if actions else 1.0
-
-    quality["final"] = {
-        "header_complete": header_complete,
-        "missing_header_fields": missing_header_fields,
-        "tldr_length_ok": tldr_length_ok,
-        "tldr_count": len(tldr_lines),
-        "placeholder_leakage": {
-            "ok": not placeholder_hits,
-            "hits": placeholder_hits,
-        },
-        "duplicate_case_titles": {
-            "ok": not duplicate_case_titles,
-            "titles": duplicate_case_titles,
-        },
-        "actionability_score": {
-            "items": len(actions),
-            "verbish_items": verbish_actions,
-            "ratio": actionability_ratio,
-            "ok": actionability_ratio >= 0.6,
-        },
-    }
-    write_quality_checks(work_dir, quality)
-    update_prepare_state_fields(work_dir, {"quality_checks": quality})
-    return quality
-
-
-def contract_errors_for_quality(prepare_payload: dict, quality_payload: dict) -> list[str]:
-    note_contract = prepare_payload.get("note_contract") if isinstance(prepare_payload.get("note_contract"), dict) else {}
-    if not isinstance(note_contract, dict) or not note_contract:
-        return []
-    if not note_contract.get("enforce_on_assemble"):
-        return []
-
-    final_quality = quality_payload.get("final") if isinstance(quality_payload.get("final"), dict) else {}
-    errors: list[str] = []
-    if not final_quality.get("header_complete", True):
-        missing = ", ".join(final_quality.get("missing_header_fields", []))
-        errors.append(f"header contract failed: missing {missing or 'required fields'}")
-    if not final_quality.get("tldr_length_ok", True):
-        errors.append("tldr contract failed: takeaway count outside note contract bounds")
-    placeholder_payload = final_quality.get("placeholder_leakage") if isinstance(final_quality.get("placeholder_leakage"), dict) else {}
-    if placeholder_payload and not placeholder_payload.get("ok", True):
-        hits = ", ".join(placeholder_payload.get("hits", []))
-        errors.append(f"placeholder leakage detected: {hits}")
-    duplicate_payload = final_quality.get("duplicate_case_titles") if isinstance(final_quality.get("duplicate_case_titles"), dict) else {}
-    if duplicate_payload and not duplicate_payload.get("ok", True):
-        errors.append("duplicate case titles detected across chunk boundaries")
-    actionability_payload = final_quality.get("actionability_score") if isinstance(final_quality.get("actionability_score"), dict) else {}
-    if actionability_payload and not actionability_payload.get("ok", True):
-        errors.append("action plan failed actionability threshold")
-    return errors
-
-
 def cmd_assemble(args: argparse.Namespace) -> int:
     if not ASSEMBLE_SCRIPT.is_file():
         raise FileNotFoundError(f"Assemble script not found: {ASSEMBLE_SCRIPT}")
     work_dir = ensure_dir(Path(args.work_dir), "Work directory")
-    merge_manifest_parts(work_dir)
-    build_deterministic_appendix(work_dir)
     output_md = Path(args.output_md).expanduser().resolve()
     output_html = Path(args.output_html).expanduser().resolve()
     output_md.parent.mkdir(parents=True, exist_ok=True)
@@ -5760,27 +4816,22 @@ def cmd_assemble(args: argparse.Namespace) -> int:
         prepare_payload = load_prepare_payload(work_dir)
     except FileNotFoundError:
         prepare_payload = {}
-    quality_payload = compute_final_quality_checks(work_dir, output_md)
-    contract_errors = contract_errors_for_quality(prepare_payload if isinstance(prepare_payload, dict) else {}, quality_payload)
     sentinel_path = stage_sentinel_path(work_dir, "assemble")
     duration_ms = ms_since(started_at)
-    assemble_completed = not contract_errors
     write_stage_sentinel(
         sentinel_path,
         {
             "stage": "assemble",
             "fingerprint": prepare_payload.get("fingerprint") if isinstance(prepare_payload, dict) else None,
-            "completed": assemble_completed,
+            "completed": True,
             "completed_at": datetime.now().isoformat(),
             "duration_ms": duration_ms,
             "output_md": str(output_md),
             "output_html": str(output_html),
-            "quality_checks": str(quality_checks_path(work_dir)),
-            "contract_errors": contract_errors,
         },
     )
     if isinstance(prepare_payload, dict) and prepare_payload.get("prepare_state_path"):
-        update_prepare_state_fields(work_dir, {"stage_statuses": {"assemble": "ready" if assemble_completed else "failed"}})
+        update_prepare_state_fields(work_dir, {"stage_statuses": {"assemble": "ready"}})
     record_bundle_stage_metric(
         output_html.parent,
         "assemble",
@@ -5788,7 +4839,6 @@ def cmd_assemble(args: argparse.Namespace) -> int:
         output_md=str(output_md),
         output_html=str(output_html),
         telegram_success=telegram_delivery.get("success"),
-        contract_ok=assemble_completed,
     )
 
     payload = {
@@ -5796,18 +4846,9 @@ def cmd_assemble(args: argparse.Namespace) -> int:
         "output_md": str(output_md),
         "output_html": str(output_html),
         "telegram_delivery": telegram_delivery,
-        "quality_checks": quality_payload,
-        "contract_errors": contract_errors,
         "duration_ms": duration_ms,
         "sentinel": str(sentinel_path),
     }
-    if contract_errors:
-        if args.json:
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
-            return 2
-        for error in contract_errors:
-            print(f"ASSEMBLE CONTRACT ERROR: {error}", file=sys.stderr)
-        return 2
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
@@ -5951,10 +4992,6 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # Config
     checks["config_json"] = NOTES_CONFIG_PATH.is_file()
-    effective_config = load_notes_config()
-    effective_delivery = effective_config.get("telegram_delivery") if isinstance(effective_config, dict) else {}
-    checks["telegram_delivery_enabled"] = bool(isinstance(effective_delivery, dict) and effective_delivery.get("enabled", False))
-    checks["telegram_delivery_chat"] = str(effective_delivery.get("chat") or "").strip() if isinstance(effective_delivery, dict) else ""
 
     # Audio transcription available
     has_audio = (
@@ -6005,8 +5042,6 @@ def main() -> int:
             return cmd_replace_speakers(args)
         if args.command == "build-tldr":
             return cmd_build_tldr(args)
-        if args.command == "ensure-appendix":
-            return cmd_ensure_appendix(args)
         if args.command == "assemble":
             return cmd_assemble(args)
         if args.command == "youtube":

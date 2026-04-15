@@ -1,6 +1,6 @@
 # Extraction Agent Prompt Template
 
-Parse chunk assignments from `$WORK_DIR/prepare_report.txt` and launch agents **in parallel**. Each agent writes its OWN manifest file and follows `$WORK_DIR/note-contract.json`.
+Parse chunk assignments from `$WORK_DIR/prepare_report.txt` and launch agents **in parallel**. Each agent writes its OWN manifest file.
 
 **File naming:** `chunk_A_block_01.md`, `chunk_A_block_02.md`, etc. (A/B/C/D... per chunk). Final numbering done by assemble.sh.
 
@@ -21,16 +21,16 @@ after extraction by a post-processing script.
 
 For each logical segment (topic shift = new block), write a file to $WORK_DIR/chunk_[letter]_block_NN.md
 IMPORTANT block sizing rules:
-- Split by semantic/chapter boundaries, not by a fixed number of blocks.
-- If a chunk is short or semantically narrow, one dense block is valid.
-- Do NOT create blocks shorter than 5 minutes unless the source naturally ends there.
-- Do NOT create giant catch-all blocks; split when a topic clearly changes.
+- Each block should cover 6-10 minutes of content. This is both a minimum AND a maximum.
+- Do NOT create blocks shorter than 5 minutes — merge short segments with adjacent topics.
+- Do NOT create blocks longer than 12 minutes — split long topics into subtopics.
+- Aim for 2-4 blocks per chunk. If your chunk covers 30 minutes, you need 3-5 blocks (not 1-2 giant blocks).
 - Each block MUST have 5-8 theses. If you have fewer than 5, you're being too sparse — add detail.
 - Each block must be dense and interpretive, not just a literal paraphrase of nearby transcript lines.
 - Give each block a conclusion-style title: what the block proves, changes, or clarifies for the reader.
 - Focus on ideas, models, tensions, decisions, warnings, and non-obvious implications.
 - Skip low-value procedural filler and repetitive wording.
-- `### Смысл блока` is optional and should be one short line only when the block has a clear practical implication.
+- Every block MUST end with `### Практический смысл` containing 2-4 bullets about what this changes for the reader in practice.
 
 EACH FILE structure:
 
@@ -58,23 +58,17 @@ topic: "Topic title in Russian"
 
 > *«Verbatim quote preserving exact language»* — [timestamp]   ← MAX 1 per block, only genuinely memorable phrases
 
-### Смысл блока:
-...
-[optional: one short line only if the practical implication is genuinely clear]
+### Практический смысл:
+- ...
+- ...
+[2-4 concise bullets about what this changes in practice]
 
 AFTER writing ALL block files, write ONE manifest file: $WORK_DIR/manifest_chunk_[letter].tsv
-First line = header: block_file\ttimestamp_start\ttimestamp_end\ttopic\tprimary_claim\tnames\tresources\tcase_title\thas_dialogue\tquote_text\taction_now\taction_check\taction_avoid\tquotes_count\tcases
+First line = header: block_file\ttimestamp_start\ttimestamp_end\ttopic\tnames\tresources\tquotes_count\tcases
 Then one line per block (tab-separated).
 
-The `primary_claim` column: the single strongest idea of the block in one sentence.
 The `resources` column: books, tools, platforms, apps, services mentioned (semicolon-separated). Empty if none.
-The `names` column: use "Speaker N" labels as found in the transcript if real names are still unknown.
-The `case_title` column: short case/example label or empty string.
-The `has_dialogue` column: 1 if a dialogue section is present, else 0.
-The `quote_text` column: the memorable quote text without markdown, or empty string.
-The `action_now` column: one reader-facing imperative action to try immediately, or empty string.
-The `action_check` column: one diagnostic/check question or action for the next week, or empty string.
-The `action_avoid` column: one ongoing trap/pitfall to avoid, or empty string.
+The `names` column: use "Speaker N" labels as found in the transcript.
 
 ALSO write a summary file: $WORK_DIR/summary_chunk_[letter].md
 This is a SHORT file (10-20 lines max) listing the 5-7 most important ideas from YOUR chunk.

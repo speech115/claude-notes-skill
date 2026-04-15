@@ -12,11 +12,13 @@ Triggers automatically when the user asks to create notes/конспект, or e
 
 This is a local agent skill, not an app project.
 
-Treat `notes-runner` as the source of truth for:
-- input routing
-- stage routing
-- note contract
-- final quality / contract validation
+Never ask about:
+
+- preview servers
+- `runtimeExecutable`
+- `package.json`
+- `manage.py`
+- "setting up this repo"
 
 Use the bundled helper:
 
@@ -136,7 +138,8 @@ Goal: keep `/notes` deterministic. Prefer the runner state over ad-hoc decisions
 - Do not rerun `youtube/local/audio ... --prepare` after it already succeeded unless the user explicitly asked for refresh.
 - Do not read the full transcript into main context.
 - If the helper succeeded and `transcript_path` exists, `warnings` are informational. Continue unless the helper itself exited non-zero.
-- Prefer `$EXECUTION_PLAN`, `$STATUS`, `note-contract.json`, and `quality-checks.json` over any hand-written heuristics in the skill.
+- Prefer `$EXECUTION_PLAN` from the helper JSON over re-inferring orchestration in the skill.
+- Prefer `$STATUS` from the helper JSON over re-inferring progress from files manually.
 - If `$PREPARE_REUSED == true`, assume this is a resume/continue path and skip any stage already marked ready in `$STATUS`.
 - Valid YouTube transcript sources are: `existing`, `youtube-transcript-api`, `subtitles`, `api`. `api` means the slower audio fallback ran; it is not an error by itself.
 - Do not use `ToolSearch` or `mcp__telegram__send_file` from this skill. Telegram is best-effort inside `assemble` only.
@@ -147,12 +150,12 @@ After prepare:
 
 1. Prefer runner-generated prompt packs from `$EXECUTION_PLAN.prompt_packs`.
 2. Read `$WORK_DIR/prescan_context.txt`.
-3. Read `$WORK_DIR/header-seed.json` and `$WORK_DIR/note-contract.json` before writing `header.md`.
+3. Read `$WORK_DIR/header-seed.json` before writing `header.md`.
 4. Read block templates from `${CLAUDE_SKILL_DIR}/block-templates/` only if the prompt pack files are missing.
 
 ### Extraction routing
 
-Use `$EXECUTION_PLAN.mode` and `*.should_run` flags as the source of truth for routing. Do not invent extra stages.
+Use `$EXECUTION_PLAN.mode` as the source of truth for routing.
 
 **If `$EXECUTION_PLAN.mode == "single"` and `$EXECUTION_PLAN.extraction.should_run == true`:** use **single-agent mode**.
 
@@ -195,19 +198,16 @@ ${CLAUDE_SKILL_DIR}/scripts/notes-runner build-tldr "$WORK_DIR" --json
 ### Title + header
 
 1. Read `speakers.txt` if it exists, plus `prescan_context.txt`, plus `$EXECUTION_PLAN.title_header.header_seed_path`.
-2. Respect `$EXECUTION_PLAN.content_mode` and `$EXECUTION_PLAN.contract`; do not improvise a different note schema.
-3. Generate title (`$FINAL_TITLE`) as `[Speaker] — [Core Topic]`.
+2. Generate title (`$FINAL_TITLE`) as `[Speaker] — [Core Topic]`.
    - Example: `Роман — Тело, энергия и продуктивность`
    - If `$EXECUTION_PLAN.title_header.author_hint` or `speaker_candidates` names a likely YouTube author/uploader and the material is single-speaker, use that real name as `[Speaker]`.
    - No clear speaker name: `[Topic] (групповая сессия)`
    - Single unnamed YouTube speaker with no usable author hint: use a descriptive topic title, not `Speaker 1`
    - Prefer `$EXECUTION_PLAN.title_header.title_candidates` before inventing a fresh title from scratch.
-4. Set:
+3. Set:
    - `$OUTPUT_MD` → `$BUNDLE_DIR/$FINAL_TITLE.md`
    - `$OUTPUT_HTML` → `$BUNDLE_DIR/$FINAL_TITLE.html`
-5. Write `$WORK_DIR/header.md` using the runner-generated header prompt or the header template as fallback.
-   - Preserve deterministic metadata lines from `header-seed.json` / `note-contract.json`.
-   - Generate only the abstract and `Главная рамка автора`.
+4. Write `$WORK_DIR/header.md` using the runner-generated header prompt or the header template as fallback.
 
 ### Assemble
 
@@ -225,7 +225,6 @@ ${CLAUDE_SKILL_DIR}/scripts/notes-runner assemble \
 The assemble step generates the appendix deterministically from manifests.
 
 If assemble exits non-zero, report the error and stop.
-If assemble returns `contract_errors`, surface them to the user as the reason the note was not accepted.
 
 If `telegram_delivery.success == false`, treat it as a warning only. The notes files are already the primary result. Do not attempt manual Telegram fallback from Claude.
 

@@ -1,14 +1,21 @@
-# Claude Notes Skill
+# Notes Skill
 
-`/notes` skill for Claude Code. Turns YouTube videos, audio files, and text transcripts into detailed study packages with timestamped blocks, TL;DR, and appendix.
+`/notes` skill for local coding agents. Turns YouTube videos, audio files, and text transcripts into detailed study packages with timestamped blocks, TL;DR, and appendix.
 
 Works on **macOS**, **Linux**, and **WSL**.
 
-## One-command install
+## Install
+
+Preferred from a local checkout:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/speech115/claude-notes-skill/main/install.sh)
+cd /path/to/notes-skill
+bash ./install.sh
 ```
+
+The installer defaults to `~/.agents/skills/notes/` and falls back to `~/.claude/skills/notes/` if that legacy path already exists.
+
+If you mirror the repo to GitHub, you can also run the same installer via the raw `install.sh` URL for your chosen repo slug.
 
 ## Requirements
 
@@ -27,7 +34,7 @@ pip install yt-dlp
 
 ## First run
 
-Restart Claude Code, then:
+Restart your agent client, then:
 
 ```text
 /notes https://www.youtube.com/watch?v=...
@@ -38,6 +45,17 @@ Restart Claude Code, then:
 Or just say "сделай конспект" with a URL or file path.
 
 Run `notes-runner doctor` to check your setup.
+
+## Stable workflow
+
+Treat this repo as the single source of truth. Do not patch the live skill directory by hand.
+
+- Work in a feature branch.
+- Run `scripts/release-check.sh`.
+- Promote the checked-out repo to the live skill with `scripts/promote-live.sh`.
+- Tag the stable commit after the live smoke check passes.
+
+See [RELEASE.md](RELEASE.md).
 
 ## What works
 
@@ -100,6 +118,10 @@ See [ADVANCED.md](ADVANCED.md) for:
 - Telegram voice messages
 - Telegram auto-delivery
 
+By default, generated notes are auto-delivered to the Telegram channel `Конспекты` (`-1003850136767`) when a compatible `digest-runner` is available.
+Use `config.json` only if you want to override that target or disable delivery for this machine.
+
 ## Safety note
 
 Do not copy someone else's `config.json`. Use `config.example.json` as template.
+Keep `config.json` local-only: it may contain Telegram delivery settings and should not be committed or shared.

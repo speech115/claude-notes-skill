@@ -1,0 +1,254 @@
+{
+  "updated_at": "2026-04-01T13:32:28.604933",
+  "bundle_dir": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5",
+  "title": "Мечтатель — 5 вопросов, которые изменят реальность",
+  "video_id": "UIrx6qUYvhk",
+  "source_kind": "youtube",
+  "source_url": "https://www.youtube.com/watch?v=UIrx6qUYvhk",
+  "transcript_path": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/transcript.md",
+  "transcript_source": {
+    "kind": "existing",
+    "path": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/transcript.md"
+  },
+  "audio_path": null,
+  "source_identity": {
+    "source_kind": "youtube",
+    "author_hint": "Мечтатель",
+    "speaker_candidates": [
+      "Мечтатель"
+    ],
+    "youtube": {
+      "video_id": "UIrx6qUYvhk",
+      "channel": "Мечтатель",
+      "channel_id": "UCNqikLZgU7LHyrqrT-u0s0w",
+      "uploader": "Мечтатель",
+      "uploader_id": "@Dreamerstart",
+      "creator": null
+    }
+  },
+  "telemetry": {
+    "transcript_acquisition_ms": 11,
+    "prepare_ms": 33,
+    "prepare_reused": false,
+    "warnings": 0,
+    "stages": {
+      "replace-speakers": {
+        "duration_ms": 4,
+        "modified_files": 0,
+        "mappings": 1
+      },
+      "assemble": {
+        "duration_ms": 1168,
+        "output_md": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/Мечтатель — 5 вопросов, которые изменят реальность.md",
+        "output_html": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/Мечтатель — 5 вопросов, которые изменят реальность.html",
+        "telegram_success": false
+      }
+    }
+  },
+  "chapters_count": 7,
+  "prepare": {
+    "work_dir": "/private/tmp/notes_20260401131610_d9a8b83a2d65",
+    "fingerprint": "d9a8b83a2d65",
+    "execution_mode": "multi",
+    "stage_hints": {
+      "speaker_identification": "required",
+      "appendix": "deterministic-fallback"
+    },
+    "stage_statuses": {
+      "speaker_identification": "missing",
+      "extraction": "missing",
+      "tldr": "missing",
+      "assemble": "missing"
+    },
+    "chunk_plan": [
+      {
+        "id": "A",
+        "file": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/transcript.md",
+        "line_start": 1,
+        "line_end": 302,
+        "context_start": null,
+        "context_end": null,
+        "estimated_tokens": 4720,
+        "chunk_fingerprint": "4acf949091ce",
+        "prompt_path": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-A.md",
+        "stage_sentinel_path": "/tmp/notes_20260401131610_d9a8b83a2d65/stages/extraction-A.json",
+        "status": null,
+        "expected_outputs": [
+          "manifest_chunk_A.tsv",
+          "summary_chunk_A.md",
+          "stages/extraction-A.json"
+        ]
+      },
+      {
+        "id": "B",
+        "file": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/transcript.md",
+        "line_start": 303,
+        "line_end": 604,
+        "context_start": 279,
+        "context_end": 302,
+        "estimated_tokens": 4731,
+        "chunk_fingerprint": "c288afcb123c",
+        "prompt_path": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-B.md",
+        "stage_sentinel_path": "/tmp/notes_20260401131610_d9a8b83a2d65/stages/extraction-B.json",
+        "status": null,
+        "expected_outputs": [
+          "manifest_chunk_B.tsv",
+          "summary_chunk_B.md",
+          "stages/extraction-B.json"
+        ]
+      },
+      {
+        "id": "C",
+        "file": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/transcript.md",
+        "line_start": 605,
+        "line_end": 906,
+        "context_start": 581,
+        "context_end": 604,
+        "estimated_tokens": 4722,
+        "chunk_fingerprint": "f359ca773a37",
+        "prompt_path": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-C.md",
+        "stage_sentinel_path": "/tmp/notes_20260401131610_d9a8b83a2d65/stages/extraction-C.json",
+        "status": null,
+        "expected_outputs": [
+          "manifest_chunk_C.tsv",
+          "summary_chunk_C.md",
+          "stages/extraction-C.json"
+        ]
+      },
+      {
+        "id": "D",
+        "file": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/transcript.md",
+        "line_start": 907,
+        "line_end": 1208,
+        "context_start": 883,
+        "context_end": 906,
+        "estimated_tokens": 4714,
+        "chunk_fingerprint": "a36d75a57cc9",
+        "prompt_path": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-D.md",
+        "stage_sentinel_path": "/tmp/notes_20260401131610_d9a8b83a2d65/stages/extraction-D.json",
+        "status": null,
+        "expected_outputs": [
+          "manifest_chunk_D.tsv",
+          "summary_chunk_D.md",
+          "stages/extraction-D.json"
+        ]
+      }
+    ],
+    "prepare_state_path": "/private/tmp/notes_20260401131610_d9a8b83a2d65/prepare_state.json",
+    "prepare_plan_path": "/private/tmp/notes_20260401131610_d9a8b83a2d65/prepare_plan.json",
+    "report_path": "/private/tmp/notes_20260401131610_d9a8b83a2d65/prepare_report.txt",
+    "files": 1,
+    "total_lines": 1208,
+    "duration_estimate": "22:38",
+    "unique_speakers": 0,
+    "total_chunks": 4,
+    "title_candidates": [
+      "5 ВОПРОСОВ, которые изменят твою РЕАЛЬНОСТЬ",
+      "Мечтатель",
+      "Почему мы гаснем",
+      "Вопрос №1",
+      "Вопрос №2",
+      "Я пахал по 10 часов в сутки, качал"
+    ],
+    "prompt_packs": {
+      "dir": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts",
+      "stage_dir": "/tmp/notes_20260401131610_d9a8b83a2d65/stages",
+      "header_seed": "/tmp/notes_20260401131610_d9a8b83a2d65/header-seed.json",
+      "header": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/header.md",
+      "speaker_identification": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/speaker-identification.md",
+      "tldr_agent": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/tldr-agent.md",
+      "tldr_strategy": "agent",
+      "extract": {
+        "A": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-A.md",
+        "B": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-B.md",
+        "C": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-C.md",
+        "D": "/tmp/notes_20260401131610_d9a8b83a2d65/prompts/extract-D.md"
+      }
+    },
+    "header_seed": {
+      "title_candidates": [
+        "5 ВОПРОСОВ, которые изменят твою РЕАЛЬНОСТЬ",
+        "Мечтатель",
+        "Почему мы гаснем",
+        "Вопрос №1",
+        "Вопрос №2",
+        "Я пахал по 10 часов в сутки, качал"
+      ],
+      "topic_hint": "Мечтатель",
+      "duration_estimate": "22:38",
+      "speaker_stage": "required",
+      "participants_hint": "multi-speaker or interview",
+      "source_files": [
+        "transcript.md"
+      ],
+      "author_hint": "Мечтатель",
+      "speaker_candidates": [
+        "Мечтатель"
+      ],
+      "source_identity": {
+        "source_kind": "youtube",
+        "author_hint": "Мечтатель",
+        "speaker_candidates": [
+          "Мечтатель"
+        ],
+        "youtube": {
+          "video_id": "UIrx6qUYvhk",
+          "channel": "Мечтатель",
+          "channel_id": "UCNqikLZgU7LHyrqrT-u0s0w",
+          "uploader": "Мечтатель",
+          "uploader_id": "@Dreamerstart",
+          "creator": null
+        }
+      },
+      "bundle_dir": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5",
+      "raw_title": "5 ВОПРОСОВ, которые изменят твою РЕАЛЬНОСТЬ",
+      "source_kind": null,
+      "suggested_output_md": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/конспект.md",
+      "suggested_output_html": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/конспект.html"
+    },
+    "source_identity": {
+      "source_kind": "youtube",
+      "author_hint": "Мечтатель",
+      "speaker_candidates": [
+        "Мечтатель"
+      ],
+      "youtube": {
+        "video_id": "UIrx6qUYvhk",
+        "channel": "Мечтатель",
+        "channel_id": "UCNqikLZgU7LHyrqrT-u0s0w",
+        "uploader": "Мечтатель",
+        "uploader_id": "@Dreamerstart",
+        "creator": null
+      }
+    },
+    "telemetry": {
+      "prepare_duration_ms": 33
+    },
+    "bundle_dir": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5",
+    "reused": false
+  },
+  "outputs": {
+    "markdown": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/Мечтатель — 5 вопросов, которые изменят реальность.md",
+    "html": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/Мечтатель — 5 вопросов, которые изменят реальность.html",
+    "telegram_html": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/Мечтатель — 5 вопросов, которые изменят реальность.html"
+  },
+  "telegram_delivery": {
+    "enabled": false,
+    "attempted": false,
+    "success": false,
+    "chat": "-1003850136767",
+    "caption": "📝 Конспект видео: Мечтатель — 5 вопросов, которые изменят реальность\nhttps://www.youtube.com/watch?v=UIrx6qUYvhk",
+    "parse_mode": "md",
+    "mcp_url": "http://127.0.0.1:8799/mcp",
+    "runner": "/Users/sereja/Projects/families/telegram/telegram-digest/scripts/digest-runner",
+    "file_path": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/Мечтатель — 5 вопросов, которые изменят реальность.html",
+    "result": {
+      "chat": "-1003850136767",
+      "file_path": "/Users/sereja/Downloads/конспекты/UIrx6qUYvhk-5/Мечтатель — 5 вопросов, которые изменят реальность.html",
+      "message_id": 39,
+      "chat_id": -1003850136767,
+      "mcp_url": "http://127.0.0.1:8799/mcp"
+    },
+    "reason": "skipped-by-request"
+  }
+}
