@@ -4,18 +4,50 @@ set -euo pipefail
 # Public GitHub default for remote installs.
 REPO_SLUG="${NOTES_INSTALL_REPO:-speech115/notes-skill}"
 REPO_REF="${NOTES_INSTALL_REF:-main}"
-CODEX_SKILL_DIR="${HOME}/.agents/skills/notes"
+CODEX_HOME_DIR="${CODEX_HOME:-${HOME}/.codex}"
+CODEX_SKILL_DIR="${CODEX_HOME_DIR}/skills/notes"
+AGENTS_SKILL_DIR="${HOME}/.agents/skills/notes"
 LEGACY_SKILL_DIR="${HOME}/.claude/skills/notes"
+LOCAL_BIN_DIR="${HOME}/.local/bin"
+LOCAL_RUNNER_LINK="${LOCAL_BIN_DIR}/notes-runner"
 
 choose_skill_dir() {
   if [[ -n "${NOTES_SKILL_TARGET_DIR:-}" ]]; then
     echo "${NOTES_SKILL_TARGET_DIR}"
     return
   fi
-  if [[ -d "$CODEX_SKILL_DIR" || ! -d "$LEGACY_SKILL_DIR" ]]; then
+
+  if [[ -d "$CODEX_SKILL_DIR" ]]; then
     echo "$CODEX_SKILL_DIR"
-  else
+    return
+  fi
+
+  if [[ -d "$AGENTS_SKILL_DIR" ]]; then
+    echo "$AGENTS_SKILL_DIR"
+    return
+  fi
+
+  if [[ -d "$LEGACY_SKILL_DIR" ]]; then
     echo "$LEGACY_SKILL_DIR"
+    return
+  fi
+
+  echo "$CODEX_SKILL_DIR"
+}
+
+ensure_runner_link() {
+  mkdir -p "$LOCAL_BIN_DIR"
+  ln -sfn "$SKILL_DIR/scripts/notes-runner" "$LOCAL_RUNNER_LINK"
+}
+
+print_runner_hint() {
+  if [[ ":${PATH}:" == *":${LOCAL_BIN_DIR}:"* ]]; then
+    echo "CLI:"
+    echo "  notes-runner doctor"
+  else
+    echo "CLI:"
+    echo "  ${SKILL_DIR}/scripts/notes-runner doctor"
+    echo "  Add ${LOCAL_BIN_DIR} to PATH if you want a global 'notes-runner' command."
   fi
 }
 
@@ -127,9 +159,13 @@ fi
 
 chmod +x "$SKILL_DIR/scripts/notes-runner" "$SKILL_DIR/assemble.sh" "$SKILL_DIR/prepare.sh" 2>/dev/null || true
 chmod 600 "$SKILL_DIR/config.json" 2>/dev/null || true
+ensure_runner_link
 
 echo ""
 echo "=== Installed! ==="
+echo ""
+echo "Installed skill dir:"
+echo "  $SKILL_DIR"
 echo ""
 echo "Restart your agent client, then try:"
 echo "  /notes https://www.youtube.com/watch?v=..."
@@ -153,4 +189,7 @@ else
   echo ""
 fi
 
-echo "Run 'notes-runner doctor' to verify your setup."
+echo "Smoke check:"
+"$SKILL_DIR/scripts/notes-runner" doctor || true
+echo ""
+print_runner_hint

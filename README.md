@@ -6,16 +6,25 @@ Works on **macOS**, **Linux**, and **WSL**.
 
 ## Install
 
-Preferred from a local checkout:
+Fastest install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/speech115/notes-skill/main/install.sh | bash
+```
+
+That is the intended Codex flow. It installs the skill, runs a smoke check, and tells you whether `notes-runner` is globally available.
+
+Local checkout works too:
 
 ```bash
 cd /path/to/notes-skill
 bash ./install.sh
 ```
 
-The installer defaults to `~/.agents/skills/notes/` and falls back to `~/.claude/skills/notes/` if that legacy path already exists.
-
-If you mirror the repo to GitHub, you can also run the same installer via the raw `install.sh` URL for your chosen repo slug.
+Install target order:
+- keep an existing install where it already lives
+- otherwise prefer `$CODEX_HOME/skills/notes` (usually `~/.codex/skills/notes`)
+- fall back to `~/.agents/skills/notes` or `~/.claude/skills/notes` only when those already exist
 
 ## Requirements
 
@@ -44,7 +53,13 @@ Restart your agent client, then:
 
 Or just say "сделай конспект" with a URL or file path.
 
-Run `notes-runner doctor` to check your setup.
+The installer already runs a doctor smoke check for you. If you want to rerun it manually:
+
+```bash
+notes-runner doctor
+```
+
+If `notes-runner` is not on PATH yet, use the full path the installer prints at the end.
 
 ## Stable workflow
 
