@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Notes Skill Install</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --panel: #161b22;
+        --border: #30363d;
+        --text: #e6edf3;
+        --muted: #9da7b3;
+        --accent: #2f81f7;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at top, rgba(47, 129, 247, 0.22), transparent 36%),
+          linear-gradient(180deg, #0d1117, #05070a);
+        color: var(--text);
+      }
+
+      main {
+        width: min(760px, 100%);
+        padding: 32px;
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        background: color-mix(in srgb, var(--panel) 92%, black);
+        box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(32px, 6vw, 52px);
+        line-height: 1.05;
+      }
+
+      p {
+        margin: 0 0 16px;
+        color: var(--muted);
+      }
+
+      pre {
+        overflow-x: auto;
+        margin: 24px 0;
+        padding: 18px 20px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: #0a0f14;
+        color: var(--text);
+        font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+
+      a {
+        color: var(--text);
+      }
+
+      .cta {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 48px;
+        padding: 0 18px;
+        border-radius: 999px;
+        background: var(--accent);
+        color: white;
+        text-decoration: none;
+        font-weight: 600;
+      }
+
+      .meta {
+        margin-top: 18px;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p>One-command install for Codex</p>
+      <h1>Notes Skill</h1>
+      <pre><code>curl -fsSL https://notes.speech115.com/install | bash</code></pre>
+      <a class="cta" href="https://github.com/speech115/notes-skill">Open GitHub Repo</a>
+      <p class="meta">If you opened this in a browser, the installer lives at <a href="/install">/install</a>.</p>
+    </main>
+  </body>
+</html>

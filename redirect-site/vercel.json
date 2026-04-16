@@ -1,0 +1,18 @@
+{
+  "cleanUrls": true,
+  "redirects": [
+    {
+      "source": "/install",
+      "destination": "https://raw.githubusercontent.com/speech115/notes-skill/main/install.sh",
+      "permanent": false
+    }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=300" }
+      ]
+    }
+  ]
+}
