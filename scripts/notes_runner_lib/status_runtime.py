@@ -32,6 +32,12 @@ def build_status_payload(work_dir: Path) -> dict:
         chunk_plan = []
     chunk_statuses = build_chunk_statuses(work_dir, chunk_plan)
     stages = build_stage_statuses(work_dir, prepare_payload, chunk_statuses)
+    stage_statuses = {
+        "speaker_identification": stages["speaker_identification"]["status"],
+        "extraction": stages["extraction"]["status"],
+        "tldr": stages["tldr"]["status"],
+        "assemble": stages["assemble"]["status"],
+    }
     payload = {
         "work_dir": str(work_dir),
         "fingerprint": prepare_payload.get("fingerprint"),
@@ -40,7 +46,7 @@ def build_status_payload(work_dir: Path) -> dict:
         "chunk_plan": chunk_plan,
         "chunk_statuses": chunk_statuses,
         "stage_hints": prepare_payload.get("stage_hints", {}),
-        "stage_statuses": prepare_payload.get("stage_statuses", {}),
+        "stage_statuses": stage_statuses,
         "stages": stages,
         "prompt_packs": prepare_payload.get("prompt_packs", {}),
         "header_seed": prepare_payload.get("header_seed", {}),

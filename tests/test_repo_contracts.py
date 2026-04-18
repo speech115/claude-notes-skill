@@ -215,6 +215,27 @@ class RepoContractTests(unittest.TestCase):
         for marker in forbidden:
             self.assertNotIn(marker, text)
 
+    def test_skill_contract_promises_end_to_end_delivery(self) -> None:
+        text = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required = [
+            "Do not stop after `--prepare` succeeds.",
+            "Continue autonomously through extraction, header, and assemble until the final note files exist or a real error stops the run.",
+            "Do not ask the user to manually run extraction, `replace-speakers`, `build-tldr`, or `assemble`.",
+            "Only report the final note paths or a real blocking error.",
+        ]
+        for marker in required:
+            self.assertIn(marker, text)
+
+    def test_skill_contract_retries_fixable_assemble_contract_failures(self) -> None:
+        text = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required = [
+            "If `assemble` exits non-zero or returns `contract_errors`, inspect the failure before giving up.",
+            "For fixable note-quality failures, repair the upstream files you control and rerun `assemble`.",
+            "Do this repair loop up to 2 times.",
+        ]
+        for marker in required:
+            self.assertIn(marker, text)
+
     def test_quick_suite_no_longer_depends_on_download_bundles(self) -> None:
         text = (REPO_ROOT / "scripts" / "test-pipeline.sh").read_text(encoding="utf-8")
         self.assertNotIn("$HOME/Downloads/конспекты", text)

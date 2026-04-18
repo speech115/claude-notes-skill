@@ -128,6 +128,14 @@ Read the JSON output and extract these variables:
 
 **IMPORTANT: Do NOT read the transcript into main context.** The extraction agents read it themselves. Reading it here wastes ~2K+ tokens. Only read `prescan_context.txt` in main context.
 
+## One-shot contract
+
+- Do not stop after `--prepare` succeeds.
+- Continue autonomously through extraction, header, and assemble until the final note files exist or a real error stops the run.
+- Do not ask the user to manually run extraction, `replace-speakers`, `build-tldr`, or `assemble`.
+- If worker agents are needed for extraction, launch them yourself, wait for them, validate their outputs, and keep going.
+- Only report the final note paths or a real blocking error.
+
 ## Processing flow
 
 Goal: keep `/notes` deterministic. Prefer the runner state over ad-hoc decisions.
@@ -229,8 +237,21 @@ Run exactly once when `$EXECUTION_PLAN.assemble.should_run == true`:
 
 The assemble step generates the appendix deterministically from manifests.
 
-If assemble exits non-zero, report the error and stop.
-If assemble returns `contract_errors`, surface them to the user as the reason the note was not accepted.
+If `assemble` exits non-zero or returns `contract_errors`, inspect the failure before giving up.
+For fixable note-quality failures, repair the upstream files you control and rerun `assemble`.
+Do this repair loop up to 2 times.
+
+Typical fixable failures:
+- actionability too weak -> strengthen `action_now`, `action_check`, `action_avoid`, and practical wording in blocks/summaries
+- note too compressed for duration -> expand block coverage instead of polishing prose
+- weak appendix/action plan -> improve manifest action fields and rerun assemble
+- missing header contract fields -> fix `header.md` and rerun
+
+Only stop immediately for real blockers:
+- helper command exits non-zero before artifacts exist
+- required source files are missing
+- a chunk agent failed to produce required files
+- the contract error points to missing source evidence you cannot invent honestly
 
 If `telegram_delivery.success == false`, treat it as a warning only. The notes files are already the primary result. Do not attempt manual Telegram fallback from the agent.
 
@@ -246,3 +267,4 @@ At the end, report only the practical result:
 Be concise.
 
 Do not paste the generated notes into chat when files were already written successfully.
+Do not stop earlier with an internal stage update when the run can still continue autonomously.
