@@ -32,10 +32,11 @@ run_runner() {
 
 RUN_CMD="run_runner"
 
-# Known-good bundles
-BUNDLE_SHORT="$HOME/Downloads/конспекты/gjpEwA5zky4-you-need-to-work-100x-harder"
-BUNDLE_MEDIUM="$HOME/Downloads/конспекты/-5DylM1EdI4-7-insane-use-cases-for-manus-ai-with-zero-code"
-BUNDLE_LONG="$HOME/Downloads/конспекты/2026-03-27-2630926a"
+# Optional long-form bundles for --full integration checks
+FULL_BUNDLES_ROOT="${NOTES_TEST_FULL_BUNDLES_ROOT:-${HOME}/Downloads/конспекты}"
+FULL_SHORT_DIR="$FULL_BUNDLES_ROOT/gjpEwA5zky4-you-need-to-work-100x-harder"
+FULL_MEDIUM_DIR="$FULL_BUNDLES_ROOT/-5DylM1EdI4-7-insane-use-cases-for-manus-ai-with-zero-code"
+FULL_LONG_DIR="$FULL_BUNDLES_ROOT/2026-03-27-2630926a"
 
 # ── Colors & counters ───────────────────────────────────────────────────────
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -99,11 +100,90 @@ copy_fixture() {
   echo "$dst"
 }
 
+GENERATED_PREPARE_ROOT=""
+
+ensure_generated_prepare_root() {
+  if [[ -z "$GENERATED_PREPARE_ROOT" ]]; then
+    GENERATED_PREPARE_ROOT=$(mk_tmpdir)
+  fi
+}
+
+prepare_transcript_fixture() {
+  local kind="$1"
+  ensure_generated_prepare_root
+  local fixture_dir="$GENERATED_PREPARE_ROOT/$kind"
+  local transcript="$fixture_dir/transcript.md"
+  if [[ -f "$transcript" ]]; then
+    echo "$transcript"
+    return
+  fi
+
+  mkdir -p "$fixture_dir"
+  python3 - <<'PY' "$kind" "$transcript"
+from pathlib import Path
+import sys
+
+kind = sys.argv[1]
+path = Path(sys.argv[2])
+
+
+def fmt(seconds: int) -> str:
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def monologue_line(idx: int, seconds: int, topic: str) -> str:
+    return f"*{fmt(seconds)}* я последовательно разбираю {topic}, добавляю контекст, пример и практический вывод, фрагмент {idx}."
+
+
+def dialogue_line(idx: int, seconds: int) -> str:
+    speaker = "Speaker 1" if idx % 2 else "Speaker 2"
+    if speaker == "Speaker 1":
+        text = "задаёт уточняющий вопрос о выборе, риске и следующем действии"
+    else:
+        text = "отвечает подробно, приводит кейс клиента и разворачивает аргумент до практического вывода"
+    return f"*{fmt(seconds)}* **{speaker}**: {text}, реплика {idx}."
+
+
+spec = {
+    "short": {"total": 75, "max_seconds": 5 * 60 + 50, "mode": "monologue", "topic": "одну компактную тему без диалога"},
+    "medium": {"total": 643, "max_seconds": 32 * 60, "mode": "monologue", "topic": "длинный монолог о системной работе, энергии и дисциплине"},
+    "long": {"total": 3221, "max_seconds": 95 * 60, "mode": "dialogue"},
+}[kind]
+
+total = spec["total"]
+max_seconds = spec["max_seconds"]
+lines: list[str] = []
+for index in range(total):
+    seconds = round(index * max_seconds / max(total - 1, 1))
+    if spec["mode"] == "dialogue":
+        lines.append(dialogue_line(index + 1, seconds))
+    else:
+        lines.append(monologue_line(index + 1, seconds, spec["topic"]))
+
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+  echo "$transcript"
+}
+
+# ── T00: regression tests for routing / binary guards ───────────────────────
+test_regression_unit_suite() {
+  echo -e "${BOLD}T00: routing and binary-guard regressions${RESET}"
+  if ! python3 -m unittest discover -s "$SKILL_DIR/tests" -p 'test_*.py' >/dev/null 2>&1; then
+    fail "T00" "python unittest regressions failed"; return
+  fi
+  pass "T00"
+}
+
 # ── T01: prepare short transcript (75 lines, 1 chunk) ──────────────────────
 test_prepare_short() {
   echo -e "${BOLD}T01: prepare short transcript (75 lines)${RESET}"
-  local transcript="$BUNDLE_SHORT/transcript.md"
-  if [[ ! -f "$transcript" ]]; then skip "T01" "transcript not found"; return; fi
+  local transcript
+  transcript=$(prepare_transcript_fixture short)
 
   local tmpout
   tmpout=$(mk_tmpdir)
@@ -158,8 +238,8 @@ test_prepare_short() {
 # ── T02: prepare medium transcript (643 lines, multi-chunk) ────────────────
 test_prepare_medium() {
   echo -e "${BOLD}T02: prepare medium transcript (643 lines, expect 2+ chunks)${RESET}"
-  local transcript="$BUNDLE_MEDIUM/transcript.md"
-  if [[ ! -f "$transcript" ]]; then skip "T02" "transcript not found"; return; fi
+  local transcript
+  transcript=$(prepare_transcript_fixture medium)
 
   local tmpout
   tmpout=$(mk_tmpdir)
@@ -186,8 +266,8 @@ test_prepare_medium() {
 # ── T03: prepare long transcript (3221 lines, multi-speaker) ───────────────
 test_prepare_long() {
   echo -e "${BOLD}T03: prepare long transcript (3221 lines, expect 3+ chunks)${RESET}"
-  local transcript="$BUNDLE_LONG/transcript.md"
-  if [[ ! -f "$transcript" ]]; then skip "T03" "transcript not found"; return; fi
+  local transcript
+  transcript=$(prepare_transcript_fixture long)
 
   local tmpout
   tmpout=$(mk_tmpdir)
@@ -210,8 +290,8 @@ test_prepare_long() {
 # ── T03b: long sparse transcript should not over-split ────────────────────
 test_prepare_long_not_oversplit() {
   echo -e "${BOLD}T03b: long transcript avoids excessive chunk fan-out${RESET}"
-  local transcript="$BUNDLE_LONG/transcript.md"
-  if [[ ! -f "$transcript" ]]; then skip "T03b" "transcript not found"; return; fi
+  local transcript
+  transcript=$(prepare_transcript_fixture long)
 
   local tmpout
   tmpout=$(mk_tmpdir)
@@ -231,8 +311,8 @@ test_prepare_long_not_oversplit() {
 # ── T04: status on fresh prepare dir ───────────────────────────────────────
 test_status_fresh() {
   echo -e "${BOLD}T04: status on fresh prepare dir${RESET}"
-  local transcript="$BUNDLE_SHORT/transcript.md"
-  if [[ ! -f "$transcript" ]]; then skip "T04" "transcript not found"; return; fi
+  local transcript
+  transcript=$(prepare_transcript_fixture short)
 
   local tmpout
   tmpout=$(mk_tmpdir)
@@ -262,8 +342,8 @@ test_status_fresh() {
 # ── T04b: repeated prepare reuses existing work dir ───────────────────────
 test_prepare_reuse() {
   echo -e "${BOLD}T04b: repeated prepare reuses existing work dir${RESET}"
-  local transcript="$BUNDLE_SHORT/transcript.md"
-  if [[ ! -f "$transcript" ]]; then skip "T04b" "transcript not found"; return; fi
+  local transcript
+  transcript=$(prepare_transcript_fixture short)
 
   local tmpout
   tmpout=$(mk_tmpdir)
@@ -1272,10 +1352,10 @@ test_e2e_youtube_short() {
   echo -e "${BOLD}T15: e2e YouTube short (prepare → assemble with existing extraction)${RESET}"
 
   # Use existing known-good bundle
-  if [[ ! -d "$BUNDLE_SHORT/work" ]]; then skip "T15" "no work dir link in bundle"; return; fi
+  if [[ ! -d "$FULL_SHORT_DIR/work" ]]; then skip "T15" "no work dir link in bundle"; return; fi
 
   local work_link
-  work_link=$(readlink -f "$BUNDLE_SHORT/work" 2>/dev/null || echo "")
+  work_link=$(readlink -f "$FULL_SHORT_DIR/work" 2>/dev/null || echo "")
   if [[ -z "$work_link" || ! -d "$work_link" ]]; then
     # Try to find work dir from run.json
     skip "T15" "work dir not resolvable"; return
@@ -1363,6 +1443,7 @@ echo ""
 echo -e "${BOLD}=== Layer 1: Deterministic tests ===${RESET}"
 echo ""
 
+test_regression_unit_suite
 test_prepare_short
 test_prepare_medium
 test_prepare_long
@@ -1411,6 +1492,9 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 
 if (( FAIL_COUNT > 0 )); then
+  exit 1
+elif [[ "$MODE" == "--quick" && "$SKIP_COUNT" -gt 0 ]]; then
+  echo "Quick suite must not skip checks. Fix the harness or move the scenario to --full." >&2
   exit 1
 else
   exit 0

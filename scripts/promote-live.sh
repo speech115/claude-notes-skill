@@ -3,7 +3,32 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TARGET_DIR="${NOTES_LIVE_DIR:-$HOME/.agents/skills/notes}"
+CODEX_HOME_DIR="${CODEX_HOME:-${HOME}/.codex}"
+CODEX_SKILL_DIR="${CODEX_HOME_DIR}/skills/notes"
+AGENTS_SKILL_DIR="${HOME}/.agents/skills/notes"
+LEGACY_SKILL_DIR="${HOME}/.claude/skills/notes"
+
+choose_live_dir() {
+  if [[ -n "${NOTES_LIVE_DIR:-}" ]]; then
+    echo "${NOTES_LIVE_DIR}"
+    return
+  fi
+  if [[ -d "$CODEX_SKILL_DIR" ]]; then
+    echo "$CODEX_SKILL_DIR"
+    return
+  fi
+  if [[ -d "$AGENTS_SKILL_DIR" ]]; then
+    echo "$AGENTS_SKILL_DIR"
+    return
+  fi
+  if [[ -d "$LEGACY_SKILL_DIR" ]]; then
+    echo "$LEGACY_SKILL_DIR"
+    return
+  fi
+  echo "$CODEX_SKILL_DIR"
+}
+
+TARGET_DIR="$(choose_live_dir)"
 ALLOW_DIRTY=0
 SKIP_CHECKS=0
 
@@ -39,6 +64,33 @@ fi
 
 mkdir -p "$TARGET_DIR" "$TARGET_DIR/backups"
 
+if [[ -f "$TARGET_DIR/.live-link.json" ]]; then
+  LINKED_REPO="$(
+    python3 - <<'PY' "$TARGET_DIR/.live-link.json"
+from pathlib import Path
+import json
+import sys
+
+path = Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print("")
+else:
+    print(str(payload.get("repo_dir") or ""))
+PY
+  )"
+  if [[ -n "$LINKED_REPO" ]]; then
+    if [[ "$LINKED_REPO" == "$REPO_DIR" ]]; then
+      echo "Live target already uses dev-linked mode for this repo: $TARGET_DIR"
+      echo "Nothing to promote."
+      exit 0
+    fi
+    echo "Refusing to promote into a live target linked to another repo: $LINKED_REPO" >&2
+    exit 1
+  fi
+fi
+
 if [[ -d "$TARGET_DIR" ]]; then
   TS="$(date +%Y%m%d-%H%M%S)"
   BACKUP_TAR="$TARGET_DIR/backups/notes-skill-${TS}-pre-promote.tar.gz"
@@ -52,6 +104,7 @@ rsync -a --delete \
   --exclude '.git/' \
   --exclude 'backups/' \
   --exclude 'config.json' \
+  --exclude '.live-link.json' \
   --exclude '.ai/runtime/' \
   --exclude 'scripts/__pycache__/' \
   --exclude 'RELEASE.md' \

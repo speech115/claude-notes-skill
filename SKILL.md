@@ -1,9 +1,9 @@
 ---
 name: notes
-description: Create detailed study notes from YouTube videos or local transcripts. Use when the user says 'сделай конспект', 'конспект', 'законспектируй', 'notes', 'заметки по видео', or provides a YouTube URL and asks for a summary/notes. Also triggers on /notes.
+description: Create detailed study notes from YouTube videos, local media, or local transcripts. Use when the user says 'сделай конспект', 'конспект', 'законспектируй', 'notes', 'заметки по видео', or provides a YouTube URL and asks for a summary/notes. Also triggers on /notes.
 argument-hint: <youtube-url-or-absolute-path>
 metadata:
-  short-description: Detailed notes from YouTube or local transcripts
+  short-description: Detailed notes from YouTube, local media, or transcripts
 ---
 
 # /notes — detailed study notes
@@ -21,7 +21,7 @@ Treat `notes-runner` as the source of truth for:
 Use the bundled helper:
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner
+<skill-root>/scripts/notes-runner
 ```
 
 Do not assume a global `notes-runner` exists in `PATH`.
@@ -33,7 +33,7 @@ Do not assume a global `notes-runner` exists in `PATH`.
 - a local absolute path to `.md` or `.txt`
 
 **With audio transcription setup** (mlx-whisper or Groq API):
-- audio files (`.m4a`, `.mp3`, `.wav`, `.ogg`, `.opus`)
+- audio/video files (`.m4a`, `.mp3`, `.wav`, `.ogg`, `.opus`, `.mp4`, `.mov`, `.mkv`, `.webm`, `.avi`)
 - a directory of audio/text files (batch mode)
 
 **Advanced setup**:
@@ -41,10 +41,10 @@ Do not assume a global `notes-runner` exists in `PATH`.
 - YouTube videos without usable subtitles
 - speaker diarization
 
-If the user provides an audio file but transcription is not available, explain the setup and point to:
+If the user provides an audio/video file but transcription is not available, explain the setup and point to:
 
 ```text
-${CLAUDE_SKILL_DIR}/ADVANCED.md
+<skill-root>/ADVANCED.md
 ```
 
 ## First run
@@ -56,6 +56,7 @@ What skills are available?
 /notes https://www.youtube.com/watch?v=...
 /notes /absolute/path/to/file.md
 /notes /path/to/audio.mp3
+/notes /path/to/video.mp4
 ```
 
 ## Input routing
@@ -70,34 +71,34 @@ If no argument was provided:
 If the argument is a YouTube URL:
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner youtube "$ARGUMENTS" --prepare --json
+<skill-root>/scripts/notes-runner youtube "$ARGUMENTS" --prepare --json
 ```
 
 If the argument is an absolute path to `.md` or `.txt`:
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner local "$ARGUMENTS" --prepare --json
+<skill-root>/scripts/notes-runner local "$ARGUMENTS" --prepare --json
 ```
 
-If the argument is an absolute path to an audio file (`.m4a`, `.mp3`, `.wav`, `.ogg`, `.opus`):
+If the argument is an absolute path to an audio or video file (`.m4a`, `.mp3`, `.wav`, `.ogg`, `.opus`, `.mp4`, `.mov`, `.mkv`, `.webm`, `.avi`):
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner audio "$ARGUMENTS" --prepare --json
+<skill-root>/scripts/notes-runner audio "$ARGUMENTS" --prepare --json
 ```
 
 Use `--title "Custom Title"` when the filename is not a good title.
-Use `--language` to set the audio language (default: `ru`). Only add `--language en` for English content.
+Use `--language` to set the transcription language (default: `ru`). Only add `--language en` for English content.
 
 If the argument is a directory containing multiple files:
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner batch "$ARGUMENTS" --prepare --json
+<skill-root>/scripts/notes-runner batch "$ARGUMENTS" --prepare --json
 ```
 
 If the argument is not recognized, ask the user to provide one of:
 - a YouTube URL
 - an absolute path to `.md` / `.txt`
-- an absolute path to an audio file
+- an absolute path to an audio/video file
 - a directory for batch processing
 
 ## Error handling
@@ -139,7 +140,7 @@ Goal: keep `/notes` deterministic. Prefer the runner state over ad-hoc decisions
 - Prefer `$EXECUTION_PLAN`, `$STATUS`, `note-contract.json`, and `quality-checks.json` over any hand-written heuristics in the skill.
 - If `$PREPARE_REUSED == true`, assume this is a resume/continue path and skip any stage already marked ready in `$STATUS`.
 - Valid YouTube transcript sources are: `existing`, `youtube-transcript-api`, `subtitles`, `api`. `api` means the slower audio fallback ran; it is not an error by itself.
-- Do not use `ToolSearch` or `mcp__telegram__send_file` from this skill. Telegram is best-effort inside `assemble` only.
+- Do not use `ToolSearch` or `mcp__telegram__send_file` here. Telegram is best-effort inside `assemble` only.
 - Prefer richer coverage over aggressive compression for long-form material. A 90-180 minute source should usually produce many local blocks, not a handful of mega-blocks.
 - Treat runner-provided density requirements as hard constraints. If the extraction prompt says the chunk must yield at least `N` blocks, do not collapse it further.
 - If assemble reports that the note is too compressed for source duration, treat that as a real contract failure and expand the coverage instead of polishing wording.
@@ -152,7 +153,7 @@ After prepare:
 1. Prefer runner-generated prompt packs from `$EXECUTION_PLAN.prompt_packs`.
 2. Read `$WORK_DIR/prescan_context.txt`.
 3. Read `$WORK_DIR/header-seed.json` and `$WORK_DIR/note-contract.json` before writing `header.md`.
-4. Read block templates from `${CLAUDE_SKILL_DIR}/block-templates/` only if the prompt pack files are missing.
+4. Read block templates from `<skill-root>/block-templates/` only if the prompt pack files are missing.
 
 ### Extraction routing
 
@@ -160,7 +161,7 @@ Use `$EXECUTION_PLAN.mode` and `*.should_run` flags as the source of truth for r
 
 **If `$EXECUTION_PLAN.mode == "single"` and `$EXECUTION_PLAN.extraction.should_run == true`:** use **single-agent mode**.
 
-Launch one sonnet agent using the runner-generated extraction prompt from `$EXECUTION_PLAN.prompt_packs.extract.A` (or the only chunk entry in `chunks_to_extract`). The agent must:
+Launch one worker agent using the runner-generated extraction prompt from `$EXECUTION_PLAN.prompt_packs.extract.A` (or the only chunk entry in `chunks_to_extract`). The agent must:
 - read the transcript file itself
 - write `chunk_A_block_*.md`, `manifest_chunk_A.tsv`, `summary_chunk_A.md`
 - also write `$WORK_DIR/tldr.md`
@@ -172,7 +173,7 @@ If `$EXECUTION_PLAN.extraction.should_run == false`, do not relaunch extraction.
 
 **If `$EXECUTION_PLAN.mode == "micro-multi"` or `$EXECUTION_PLAN.mode == "multi"`:** use **parallel chunk mode**.
 
-1. If `$EXECUTION_PLAN.speaker_identification.should_run == true`, launch one sonnet speaker-ID agent using `$EXECUTION_PLAN.prompt_packs.speaker_identification`.
+1. If `$EXECUTION_PLAN.speaker_identification.should_run == true`, launch one speaker-ID agent using `$EXECUTION_PLAN.prompt_packs.speaker_identification`.
 2. Launch one extraction agent per chunk from `$EXECUTION_PLAN.extraction.chunks_to_extract`.
    - Use the runner-generated prompt file from `$EXECUTION_PLAN.prompt_packs.extract[chunk_id]`.
    - Keep `Speaker N` labels until `replace-speakers`.
@@ -184,16 +185,16 @@ If `$EXECUTION_PLAN.extraction.should_run == false`, do not relaunch extraction.
 5. Run:
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner replace-speakers "$WORK_DIR"
+<skill-root>/scripts/notes-runner replace-speakers "$WORK_DIR"
 ```
 
 6. If `$EXECUTION_PLAN.tldr.should_run == true` and `$EXECUTION_PLAN.tldr.strategy == "deterministic-merge"`, run:
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner build-tldr "$WORK_DIR" --json
+<skill-root>/scripts/notes-runner build-tldr "$WORK_DIR" --json
 ```
 
-7. If `$EXECUTION_PLAN.tldr.should_run == true` and `$EXECUTION_PLAN.tldr.strategy == "agent"`, launch one sonnet TL;DR agent using `$EXECUTION_PLAN.prompt_packs.tldr_agent`.
+7. If `$EXECUTION_PLAN.tldr.should_run == true` and `$EXECUTION_PLAN.tldr.strategy == "agent"`, launch one TL;DR agent using `$EXECUTION_PLAN.prompt_packs.tldr_agent`.
 8. If `$EXECUTION_PLAN.replace_speakers.after_tldr == true`, run `replace-speakers` once more after TL;DR completes so `tldr.md` is also cleaned.
 
 ### Title + header
@@ -218,7 +219,7 @@ ${CLAUDE_SKILL_DIR}/scripts/notes-runner build-tldr "$WORK_DIR" --json
 Run exactly once when `$EXECUTION_PLAN.assemble.should_run == true`:
 
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/notes-runner assemble \
+<skill-root>/scripts/notes-runner assemble \
   "$WORK_DIR" \
   "$OUTPUT_MD" \
   "$OUTPUT_HTML" \
@@ -231,7 +232,7 @@ The assemble step generates the appendix deterministically from manifests.
 If assemble exits non-zero, report the error and stop.
 If assemble returns `contract_errors`, surface them to the user as the reason the note was not accepted.
 
-If `telegram_delivery.success == false`, treat it as a warning only. The notes files are already the primary result. Do not attempt manual Telegram fallback from Claude.
+If `telegram_delivery.success == false`, treat it as a warning only. The notes files are already the primary result. Do not attempt manual Telegram fallback from the agent.
 
 ## Output to the user
 

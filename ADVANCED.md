@@ -47,7 +47,7 @@ The runner also checks for adjacent `.json` files (Whisper output) next to audio
 Install `whisperx` separately and use:
 
 ```bash
-~/.agents/skills/notes/scripts/notes-runner audio /absolute/path/to/file.m4a --prepare --diarize --json
+notes-runner audio /absolute/path/to/file.m4a --prepare --diarize --json
 ```
 
 If `whisperx` is missing, the runner falls back to plain transcription.
@@ -90,6 +90,7 @@ export NOTES_RUNNER_DIGEST_RUNNER=/absolute/path/to/digest-runner
 ```
 
 3. Optionally edit `~/.agents/skills/notes/config.json` if you want to override the default channel, caption behavior, or disable delivery.
+   If you are on Codex-first install layout, this is usually `~/.codex/skills/notes/config.json`.
 
 Example:
 
@@ -116,7 +117,7 @@ This needs both:
 Example runner command:
 
 ```bash
-~/.agents/skills/notes/scripts/notes-runner telegram "@username_or_chat_id" MESSAGE_ID --prepare --json
+notes-runner telegram "@username_or_chat_id" MESSAGE_ID --prepare --json
 ```
 
 ## Optional environment variables

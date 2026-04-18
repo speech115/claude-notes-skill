@@ -1,6 +1,6 @@
 # Notes Skill
 
-`/notes` skill for local coding agents. Turns YouTube videos, audio files, and text transcripts into detailed study packages with timestamped blocks, TL;DR, and appendix.
+`/notes` skill for local coding agents. Turns YouTube videos, audio/video files, and text transcripts into detailed study packages with timestamped blocks, TL;DR, and appendix.
 
 Works on **macOS**, **Linux**, and **WSL**.
 
@@ -49,6 +49,7 @@ Restart your agent client, then:
 /notes https://www.youtube.com/watch?v=...
 /notes /absolute/path/to/file.md
 /notes /path/to/lecture.mp3
+/notes /path/to/recording.mp4
 ```
 
 Or just say "сделай конспект" with a URL or file path.
@@ -66,6 +67,10 @@ If `notes-runner` is not on PATH yet, use the full path the installer prints at 
 Treat this repo as the single source of truth. Do not patch the live skill directory by hand.
 
 - Work in a feature branch.
+- For active local development, link the live skill once:
+  - `scripts/dev-link-live.sh`
+- Before `promote-live`, make sure `git status --short` is clean.
+- `scripts/promote-live.sh --allow-dirty` is an escape hatch for forensics, not the happy path.
 - Run `scripts/release-check.sh`.
 - Promote the checked-out repo to the live skill with `scripts/promote-live.sh`.
 - Tag the stable commit after the live smoke check passes.
@@ -78,7 +83,7 @@ See [RELEASE.md](RELEASE.md).
 |-------|-------------|
 | YouTube URL (with subs) | starter deps only |
 | Local `.md` / `.txt` | starter deps only |
-| Audio files (`.mp3`, `.m4a`, `.wav`, `.ogg`) | + audio transcription setup |
+| Audio/video files (`.mp3`, `.m4a`, `.wav`, `.ogg`, `.opus`, `.mp4`, `.mov`, `.mkv`, `.webm`, `.avi`) | + audio transcription setup |
 | Batch (directory of files) | same as individual files |
 | Telegram voice messages | + MCP setup |
 
@@ -123,7 +128,27 @@ Produces individual notes for each file + a `batch-index.html` with links.
 ```bash
 notes-runner doctor        # check all prerequisites
 notes-runner doctor --json # machine-readable output
+notes-runner status "$WORK_DIR" --json
 ```
+
+Safe local smoke-check without Telegram side effects:
+
+```bash
+NOTES_RUNNER_DISABLE_TELEGRAM=1 notes-runner assemble "$WORK_DIR" "$OUTPUT_MD" "$OUTPUT_HTML" "$TITLE" --skip-telegram --json
+```
+
+Debug artifacts worth opening first:
+
+- `run.json` — short bundle summary
+- `timeline.jsonl` — one line per run of this note
+- `runs/<run_id>.json` — full snapshot for a specific note revision
+- `trace.jsonl` — append-only stage trace
+- `work/prepare_state.json` and `work/stages/*.json` — orchestration state
+
+When `notes-runner` is launched from Codex, it auto-attaches the current `CODEX_THREAD_ID` as an external ref in the note history.
+You can add extra refs manually with `NOTES_RUNNER_EXTERNAL_REF` or `NOTES_RUNNER_EXTERNAL_REFS`.
+
+More detail lives in [OBSERVABILITY.md](OBSERVABILITY.md) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## Advanced features
 

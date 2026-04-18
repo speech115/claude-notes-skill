@@ -11,7 +11,7 @@
 #
 # Quality checks, contract enforcement, and deterministic appendix generation
 # are owned by scripts/notes-runner. This shell script stays focused on
-# compatibility, markdown assembly, and HTML/PDF rendering.
+# compatibility, markdown assembly, and HTML rendering.
 
 set -euo pipefail
 
@@ -192,25 +192,6 @@ rm -f "$CSS_HEADER"
 
 HTML_SIZE=$(wc -c < "$OUTPUT_HTML" | tr -d ' ')
 echo "HTML: $HTML_SIZE bytes"
-
-# ─── Step 8: PDF (optional) ───
-
-echo ""
-echo "--- Generating PDF ---"
-OUTPUT_PDF="${OUTPUT_HTML%.html}.pdf"
-if command -v weasyprint &>/dev/null; then
-  weasyprint "$OUTPUT_HTML" "$OUTPUT_PDF" 2>/dev/null && {
-    PDF_SIZE=$(wc -c < "$OUTPUT_PDF" | tr -d ' ')
-    echo "PDF: $OUTPUT_PDF ($PDF_SIZE bytes)"
-  } || echo "WARNING: weasyprint failed — skipping PDF"
-elif command -v wkhtmltopdf &>/dev/null; then
-  wkhtmltopdf --enable-local-file-access "$OUTPUT_HTML" "$OUTPUT_PDF" 2>/dev/null && {
-    PDF_SIZE=$(wc -c < "$OUTPUT_PDF" | tr -d ' ')
-    echo "PDF: $OUTPUT_PDF ($PDF_SIZE bytes)"
-  } || echo "WARNING: wkhtmltopdf failed — skipping PDF"
-else
-  echo "No PDF tool found — skipping. Install: pip install weasyprint"
-fi
 
 # ─── Summary ───
 
