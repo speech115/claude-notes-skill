@@ -91,6 +91,7 @@ If the argument is an absolute path to an audio or video file (`.m4a`, `.mp3`, `
 
 Use `--title "Custom Title"` when the filename is not a good title.
 Use `--language` to set the transcription language (default: `ru`). Only add `--language en` for English content.
+Use `--transcribe-backend parakeet --parakeet-benchmark` only when you need timing telemetry for the local MacWhisper Parakeet path.
 
 If the argument is a directory containing multiple files:
 
@@ -222,18 +223,25 @@ If `$EXECUTION_PLAN.extraction.should_run == false`, do not relaunch extraction.
 
 ### Title + header
 
-1. Read `speakers.txt` if it exists, plus `prescan_context.txt`, plus `$EXECUTION_PLAN.title_header.header_seed_path`.
-2. Respect `$EXECUTION_PLAN.content_mode` and `$EXECUTION_PLAN.contract`; do not improvise a different note schema.
-3. Generate title (`$FINAL_TITLE`) as `[Speaker] — [Core Topic]`.
+1. If `$EXECUTION_PLAN.title_header.should_run == true`, run the deterministic header builder first:
+
+```bash
+<skill-root>/scripts/notes-runner build-header "$WORK_DIR" --json
+```
+
+Use manual header generation only if `build-header` fails, returns no title/header path, or the user explicitly requires a custom title.
+2. Read `speakers.txt` if it exists, plus `prescan_context.txt`, plus `$EXECUTION_PLAN.title_header.header_seed_path` only when manual fallback is needed.
+3. Respect `$EXECUTION_PLAN.content_mode` and `$EXECUTION_PLAN.contract`; do not improvise a different note schema.
+4. Generate title (`$FINAL_TITLE`) from the `build-header` JSON title when available. In manual fallback, use `[Speaker] — [Core Topic]`.
    - Example: `Роман — Тело, энергия и продуктивность`
    - If `$EXECUTION_PLAN.title_header.author_hint` or `speaker_candidates` names a likely YouTube author/uploader and the material is single-speaker, use that real name as `[Speaker]`.
    - No clear speaker name: `[Topic] (групповая сессия)`
    - Single unnamed YouTube speaker with no usable author hint: use a descriptive topic title, not `Speaker 1`
    - Prefer `$EXECUTION_PLAN.title_header.title_candidates` before inventing a fresh title from scratch.
-4. Set:
+5. Set:
    - `$OUTPUT_MD` → `$BUNDLE_DIR/$FINAL_TITLE.md`
    - `$OUTPUT_HTML` → `$BUNDLE_DIR/$FINAL_TITLE.html`
-5. Write `$WORK_DIR/header.md` using the runner-generated header prompt or the header template as fallback.
+6. In manual fallback, write `$WORK_DIR/header.md` using the runner-generated header prompt or the header template.
    - Preserve deterministic metadata lines from `header-seed.json` / `note-contract.json`.
    - Generate only the abstract and `Главная рамка автора`.
 

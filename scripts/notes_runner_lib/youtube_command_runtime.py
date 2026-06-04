@@ -32,8 +32,7 @@ def run_youtube_command(
     call_groq_transcribe: Callable[..., dict],
     advanced_setup_message: Callable[[str, str | None], str],
     groq_payload_to_transcript_markdown: Callable[[dict], str],
-    run_prepare_for_transcript: Callable[..., dict],
-    attach_prepare_outputs: Callable[[dict[str, object], dict, Path], None],
+    run_prepare_and_attach: Callable[..., dict],
     extract_prepare_duration_ms: Callable[[dict | None], int],
     write_bundle_state_snapshot: Callable[[Path, dict], dict],
     append_trace_event: Callable[..., object],
@@ -191,13 +190,13 @@ def run_youtube_command(
             payload["chapters_path"] = str(chapters_path)
 
         if args.prepare:
-            prepare_payload = run_prepare_for_transcript(
+            run_prepare_and_attach(
+                payload,
                 transcript_path,
-                bundle_dir=bundle_dir,
+                bundle_dir,
                 refresh=args.refresh,
                 source_hints=source_hints,
             )
-            attach_prepare_outputs(payload, prepare_payload, bundle_dir)
 
         prepare_ms = extract_prepare_duration_ms(payload.get("prepare") if isinstance(payload.get("prepare"), dict) else None)
         state_payload = {

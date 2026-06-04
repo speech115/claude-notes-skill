@@ -44,6 +44,8 @@ def execution_mode_for_plan(total_chunks: int, *, content_mode: str, duration_se
     if total_chunks <= 1:
         return "single"
     if content_mode == "monologue":
+        if duration_seconds and duration_seconds <= 18 * 60 and total_chunks <= 2:
+            return "single"
         if total_chunks <= 4 and (duration_seconds == 0 or duration_seconds <= 35 * 60):
             return "micro-multi"
     if content_mode == "conversation" and total_chunks <= 5:
@@ -78,6 +80,20 @@ def _speaker_placeholder_count(payload: dict) -> int:
         return max(0, int(payload.get("unique_speakers") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _speaker_label_count(payload: dict) -> int:
+    total = _speaker_placeholder_count(payload)
+    file_entries = payload.get("files")
+    if isinstance(file_entries, list):
+        for item in file_entries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                total += max(0, int(item.get("speaker_label_cues") or 0))
+            except (TypeError, ValueError):
+                continue
+    return total
 
 
 def parse_prepare_report(report_path: Path) -> dict:
@@ -557,14 +573,15 @@ def build_stage_statuses(work_dir: Path, payload: dict, chunk_statuses: dict[str
     }
 
 
-def determine_next_action(stages: dict[str, dict]) -> str:
+def determine_next_action(stages: dict[str, dict], *, should_run_speaker: bool | None = None) -> str:
     speaker_status = stages["speaker_identification"]["status"]
     speaker_hint = stages["speaker_identification"].get("hint")
     extraction_status = stages["extraction"]["status"]
     tldr_status = stages["tldr"]["status"]
     assemble_status = stages["assemble"]["status"]
 
-    if speaker_hint == "required" and speaker_status not in {"ready", "skipped"}:
+    speaker_needed = speaker_hint == "required" if should_run_speaker is None else should_run_speaker
+    if speaker_needed and speaker_status not in {"ready", "skipped"}:
         return "speaker-identification"
     if extraction_status != "ready":
         return "extract-chunks"
@@ -588,7 +605,6 @@ def build_execution_plan(payload: dict, chunk_statuses: dict[str, dict], stages:
     persisted_mode = str(payload.get("execution_mode") or "").strip()
     mode = inferred_mode if persisted_mode == "multi" and inferred_mode == "micro-multi" else persisted_mode or inferred_mode
     content_mode = str(payload.get("content_mode") or "conversation")
-    next_action = determine_next_action(stages)
     prompt_packs = dict(payload.get("prompt_packs")) if isinstance(payload.get("prompt_packs"), dict) else {}
     header_seed = payload.get("header_seed") if isinstance(payload.get("header_seed"), dict) else {}
     note_contract = payload.get("note_contract") if isinstance(payload.get("note_contract"), dict) else {}
@@ -624,14 +640,15 @@ def build_execution_plan(payload: dict, chunk_statuses: dict[str, dict], stages:
     extraction_status = str(stages["extraction"].get("status") or "missing")
     tldr_status = str(stages["tldr"].get("status") or "missing")
     assemble_status = str(stages["assemble"].get("status") or "missing")
-    speaker_placeholders_present = _speaker_placeholder_count(payload) > 0
+    speaker_labels_present = _speaker_label_count(payload) > 0
 
     should_run_speaker = (
         mode in {"micro-multi", "multi"}
         and speaker_hint != "skip"
         and speaker_status not in {"ready", "skipped"}
-        and (speaker_hint == "required" or speaker_placeholders_present)
+        and speaker_labels_present
     )
+    next_action = determine_next_action(stages, should_run_speaker=should_run_speaker)
     should_run_extraction = extraction_status != "ready"
     tldr_strategy = (
         "inline-extraction" if mode == "single"
@@ -691,14 +708,14 @@ def build_execution_plan(payload: dict, chunk_statuses: dict[str, dict], stages:
                 and extraction_status == "ready"
                 and tldr_status != "ready"
                 and speaker_hint != "skip"
-                and speaker_placeholders_present
+                and speaker_labels_present
             ),
             "after_tldr": (
                 mode in {"micro-multi", "multi"}
                 and extraction_status == "ready"
                 and tldr_status != "ready"
                 and speaker_hint != "skip"
-                and speaker_placeholders_present
+                and speaker_labels_present
             ),
         },
         "title_header": {

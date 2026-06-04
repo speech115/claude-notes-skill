@@ -46,8 +46,7 @@ class AudioCommandDependencies:
     call_parakeet_transcribe: Callable[..., str]
     call_transcribe_helper: Callable[..., dict]
     transcript_markdown_from_api_payload: Callable[[dict], str]
-    run_prepare_for_transcript: Callable[..., dict]
-    attach_prepare_outputs: Callable[[dict[str, object], dict, Path], None]
+    run_prepare_and_attach: Callable[..., dict]
     extract_prepare_duration_ms: Callable[[dict | None], int]
     write_bundle_state_snapshot: Callable[[Path, dict], dict]
     append_trace_event: Callable[..., object]
@@ -57,6 +56,56 @@ class AudioCommandDependencies:
     groq_model: str = "whisper-large-v3-turbo"
     parakeet_model: str = "parakeet-pro:nvidia_parakeet-v3"
     transcription_feature_name: str = "Audio transcription"
+
+
+def _load_parakeet_telemetry(path: Path, *, deps: AudioCommandDependencies) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = deps.load_json(path)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _attach_parakeet_telemetry(
+    transcript_source: dict[str, object],
+    telemetry_path: Path,
+    *,
+    deps: AudioCommandDependencies,
+) -> dict[str, object] | None:
+    telemetry = _load_parakeet_telemetry(telemetry_path, deps=deps)
+    if telemetry is not None:
+        transcript_source["telemetry_path"] = str(telemetry_path)
+        transcript_source["telemetry"] = telemetry
+    return telemetry
+
+
+def _parakeet_benchmark_payload(
+    telemetry_path: Path,
+    telemetry: dict[str, object] | None,
+) -> dict[str, object]:
+    mode = "whole_file_baseline"
+    if telemetry:
+        mode = str(telemetry.get("mode") or mode)
+    chunked_comparison: dict[str, object] = {
+        "status": "not_run",
+        "reason": "Chunked Parakeet transcription is intentionally not used until baseline timing proves it is worth testing.",
+    }
+    if telemetry and telemetry.get("mode") == "chunked_fallback":
+        chunks = telemetry.get("chunks")
+        chunked_comparison = {
+            "status": "used_after_whole_file_failure",
+            "chunks": len(chunks) if isinstance(chunks, list) else None,
+            "reason": "Whole-file Parakeet failed, so the runner split the audio and merged chunk transcripts.",
+        }
+    return {
+        "backend": "macwhisper_parakeet",
+        "mode": mode,
+        "telemetry_path": str(telemetry_path),
+        "telemetry": telemetry,
+        "chunked_comparison": chunked_comparison,
+    }
 
 
 def cmd_audio(args: argparse.Namespace, *, deps: AudioCommandDependencies) -> int:
@@ -128,6 +177,8 @@ def _cmd_audio_inner(
 
         transcript_path = paths["transcript"]
         whisper_json_path = bundle_dir / "whisper_output.json"
+        parakeet_telemetry_path = bundle_dir / "parakeet_telemetry.json"
+        parakeet_telemetry: dict[str, object] | None = None
         transcript_source: dict[str, object] | None = None
         source_hints = {
             "source_kind": "video" if is_video else "audio",
@@ -136,6 +187,9 @@ def _cmd_audio_inner(
 
         use_diarize = getattr(args, "diarize", False)
         use_api_backend = getattr(args, "transcribe_backend", "auto")
+        use_parakeet_benchmark = bool(getattr(args, "parakeet_benchmark", False))
+        if use_parakeet_benchmark:
+            use_api_backend = "parakeet"
         api_backend: str | None = None
         if use_api_backend != "auto" or os.environ.get("GROQ_API_KEY"):
             try:
@@ -167,6 +221,7 @@ def _cmd_audio_inner(
                 "kind": "existing",
                 "path": str(transcript_path),
             }
+            parakeet_telemetry = _attach_parakeet_telemetry(transcript_source, parakeet_telemetry_path, deps=deps)
         elif api_backend == "groq":
             raw_json_path = bundle_dir / "groq_output.json"
             language_hint = deps.normalize_language_hint(args.language) if hasattr(args, "language") else "ru"
@@ -191,6 +246,7 @@ def _cmd_audio_inner(
                         audio_path,
                         language=language_hint,
                         json_output_path=whisper_json_path,
+                        telemetry_output_path=parakeet_telemetry_path,
                     )
                     deps.write_text(transcript_path, deps.normalize_transcript_text(raw_markdown))
                     transcript_source = {
@@ -201,6 +257,7 @@ def _cmd_audio_inner(
                         "fallback_from": "groq",
                         "fallback_reason": str(exc),
                     }
+                    parakeet_telemetry = _attach_parakeet_telemetry(transcript_source, parakeet_telemetry_path, deps=deps)
                     groq_rate_limit = getattr(exc, "details", None)
                     if isinstance(groq_rate_limit, dict):
                         transcript_source["groq_rate_limit"] = groq_rate_limit
@@ -217,6 +274,7 @@ def _cmd_audio_inner(
                 audio_path,
                 language=language_hint,
                 json_output_path=whisper_json_path,
+                telemetry_output_path=parakeet_telemetry_path,
             )
             deps.write_text(transcript_path, deps.normalize_transcript_text(raw_markdown))
             transcript_source = {
@@ -225,6 +283,7 @@ def _cmd_audio_inner(
                 "language": language_hint or "auto",
                 "raw_json": str(whisper_json_path),
             }
+            parakeet_telemetry = _attach_parakeet_telemetry(transcript_source, parakeet_telemetry_path, deps=deps)
         elif api_backend in ("deepgram", "openai"):
             raw_json_path = bundle_dir / "api_output.json"
             language_hint = deps.normalize_language_hint(args.language) if hasattr(args, "language") else "ru"
@@ -276,6 +335,7 @@ def _cmd_audio_inner(
                 audio_path,
                 language=language_hint,
                 json_output_path=whisper_json_path,
+                telemetry_output_path=parakeet_telemetry_path,
             )
             deps.write_text(transcript_path, deps.normalize_transcript_text(raw_markdown))
             transcript_source = {
@@ -284,6 +344,7 @@ def _cmd_audio_inner(
                 "language": language_hint or "auto",
                 "raw_json": str(whisper_json_path),
             }
+            parakeet_telemetry = _attach_parakeet_telemetry(transcript_source, parakeet_telemetry_path, deps=deps)
 
         payload: dict[str, object] = {
             "bundle_dir": str(bundle_dir),
@@ -300,15 +361,17 @@ def _cmd_audio_inner(
             "suggested_output_md": str(paths["notes_md"]),
             "suggested_output_html": str(paths["notes_html"]),
         }
+        if use_parakeet_benchmark:
+            payload["parakeet_benchmark"] = _parakeet_benchmark_payload(parakeet_telemetry_path, parakeet_telemetry)
 
         if args.prepare:
-            prepare_payload = deps.run_prepare_for_transcript(
+            deps.run_prepare_and_attach(
+                payload,
                 transcript_path,
-                bundle_dir=bundle_dir,
+                bundle_dir,
                 refresh=args.refresh,
                 source_hints=source_hints,
             )
-            deps.attach_prepare_outputs(payload, prepare_payload, bundle_dir)
 
         transcription_duration_ms = deps.ms_since(command_started)
         prepare_ms = deps.extract_prepare_duration_ms(payload.get("prepare") if isinstance(payload.get("prepare"), dict) else None)
@@ -329,6 +392,10 @@ def _cmd_audio_inner(
                 "prepare_reused": bool(payload.get("prepare", {}).get("reused")) if isinstance(payload.get("prepare"), dict) else False,
             },
         }
+        if parakeet_telemetry is not None:
+            state_payload["telemetry"]["parakeet"] = parakeet_telemetry
+        if use_parakeet_benchmark:
+            state_payload["parakeet_benchmark"] = _parakeet_benchmark_payload(parakeet_telemetry_path, parakeet_telemetry)
         if "prepare" in payload:
             state_payload["prepare"] = payload["prepare"]
         state_payload["trace_path"] = str(paths["trace"])

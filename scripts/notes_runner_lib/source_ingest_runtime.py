@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import html
 import json
+import os
+import re
+import shutil
 import subprocess
 import urllib.error
 import urllib.request
@@ -9,12 +13,207 @@ from typing import Callable
 
 from .common import load_json
 
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+MARKDOWN_H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$")
+TITLE_TIMESTAMP_PREFIX_RE = re.compile(r"^(?:\*?\d{1,2}:\d{2}(?::\d{2})?\*?\s+)+", re.IGNORECASE)
+TITLE_SPEAKER_PREFIX_RE = re.compile(r"^(?:\*\*)?speaker\s+\d+(?:\*\*)?\s*:?\s*", re.IGNORECASE)
+
+
+def resolve_yt_dlp_bin() -> str:
+    override = os.environ.get("NOTES_RUNNER_YTDLP_BIN")
+    if override:
+        return str(Path(override).expanduser())
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+    raise FileNotFoundError("yt-dlp not found. Install it or set NOTES_RUNNER_YTDLP_BIN.")
+
+
+def run_command(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def run_checked(command: list[str], *, cwd: Path | None = None, label: str) -> subprocess.CompletedProcess[str]:
+    result = run_command(command, cwd=cwd)
+    if result.returncode != 0:
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        detail = stderr or stdout or f"exit code {result.returncode}"
+        raise ValueError(f"{label} failed: {detail}")
+    return result
+
+
+def extract_youtube_video_id(url: str) -> str | None:
+    patterns = (
+        r"(?:youtube\.com/watch\?(?:.*?&)?v=)([A-Za-z0-9_-]{11})",
+        r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
+        r"(?:youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
+        r"(?:youtube\.com/live/)([A-Za-z0-9_-]{11})",
+        r"(?:youtube\.com/embed/)([A-Za-z0-9_-]{11})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_youtube_metadata(url: str) -> dict:
+    try:
+        result = run_checked(
+            [resolve_yt_dlp_bin(), "--dump-single-json", "--skip-download", url],
+            label="yt-dlp metadata fetch",
+        )
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict):
+            raise ValueError("yt-dlp metadata JSON was not an object")
+        return payload
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        video_id = extract_youtube_video_id(url)
+        if not video_id:
+            raise
+        return {
+            "id": video_id,
+            "title": video_id,
+            "webpage_url": url,
+            "_metadata_warning": f"yt-dlp metadata fetch failed; using URL-derived metadata: {exc}",
+        }
+
+
+def extract_youtube_chapters(metadata: dict) -> list[dict]:
+    """Extract chapter markers from YouTube metadata."""
+
+    def _ts_to_seconds(ts: str) -> int:
+        parts = ts.split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        return int(parts[0]) * 60 + int(parts[1])
+
+    def _seconds_to_ts(seconds: int) -> str:
+        minutes, sec = divmod(seconds, 60)
+        return f"{minutes}:{sec:02d}"
+
+    raw_chapters = metadata.get("chapters")
+    if raw_chapters and isinstance(raw_chapters, list):
+        result: list[dict] = []
+        for chapter in raw_chapters:
+            start = chapter.get("start_time")
+            title = chapter.get("title", "").strip()
+            if start is not None and title:
+                seconds = int(start)
+                result.append({
+                    "timestamp": _seconds_to_ts(seconds),
+                    "title": title,
+                    "seconds": seconds,
+                })
+        if result:
+            return result
+
+    description = metadata.get("description") or ""
+    chapter_re = re.compile(r"^(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+)$", re.MULTILINE)
+    matches = chapter_re.findall(description)
+    if len(matches) >= 2:
+        return [
+            {
+                "timestamp": ts.strip(),
+                "title": title.strip(),
+                "seconds": _ts_to_seconds(ts.strip()),
+            }
+            for ts, title in matches
+        ]
+
+    return []
+
+
+def _cleanup_title_text(value: str) -> str:
+    text = html.unescape(HTML_TAG_RE.sub("", value or "")).strip()
+    if not text:
+        return ""
+    heading_match = MARKDOWN_H1_RE.match(text)
+    if heading_match:
+        text = heading_match.group(1).strip()
+    text = TITLE_TIMESTAMP_PREFIX_RE.sub("", text)
+    text = TITLE_SPEAKER_PREFIX_RE.sub("", text)
+    text = text.replace("**", "").replace("__", "").replace("`", "").replace("*", "")
+    text = re.sub(r"^[>\-–—•\s:;,.]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:140].strip()
+
+
+def _cleanup_person_hint(value: str) -> str:
+    text = _cleanup_title_text(value)
+    if text.startswith("@"):
+        text = text[1:].strip()
+    text = re.sub(r"\s+", " ", text).strip(" -|")
+    return text[:80].strip()
+
+
+def _is_informative_person_hint(value: str) -> bool:
+    text = (value or "").strip()
+    if len(text) < 2:
+        return False
+    if re.fullmatch(r"speaker\s+\d+", text, flags=re.IGNORECASE):
+        return False
+    if re.fullmatch(r"[\d\s:._/\-]+", text):
+        return False
+    if text.casefold() in {"author", "creator", "uploader", "channel"}:
+        return False
+    return True
+
+
+def build_youtube_source_hints(metadata: dict) -> dict:
+    candidates: list[str] = []
+    for raw in (
+        metadata.get("creator"),
+        metadata.get("uploader"),
+        metadata.get("channel"),
+        metadata.get("artist"),
+    ):
+        cleaned = _cleanup_person_hint(str(raw or ""))
+        if cleaned and _is_informative_person_hint(cleaned):
+            candidates.append(cleaned)
+
+    deduped_candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = candidate.casefold()
+        if key in seen:
+            continue
+        deduped_candidates.append(candidate)
+        seen.add(key)
+
+    uploader_handle = str(metadata.get("uploader_id") or "").strip()
+    author_hint = deduped_candidates[0] if deduped_candidates else _cleanup_person_hint(uploader_handle)
+    if author_hint and not _is_informative_person_hint(author_hint):
+        author_hint = ""
+
+    youtube_meta = {
+        "video_id": str(metadata.get("id") or "").strip() or None,
+        "channel": _cleanup_person_hint(str(metadata.get("channel") or "")) or None,
+        "channel_id": str(metadata.get("channel_id") or "").strip() or None,
+        "uploader": _cleanup_person_hint(str(metadata.get("uploader") or "")) or None,
+        "uploader_id": uploader_handle or None,
+        "creator": _cleanup_person_hint(str(metadata.get("creator") or "")) or None,
+    }
+
+    return {
+        "source_kind": "youtube",
+        "author_hint": author_hint or None,
+        "speaker_candidates": deduped_candidates,
+        "youtube": youtube_meta,
+    }
+
 
 def find_existing_youtube_bundle(
     output_root: Path,
     url: str,
     *,
-    extract_youtube_video_id: Callable[[str], str | None],
     bundle_paths: Callable[[Path], dict[str, Path]],
 ) -> Path | None:
     video_id = extract_youtube_video_id(url)

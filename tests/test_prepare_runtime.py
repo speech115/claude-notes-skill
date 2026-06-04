@@ -45,8 +45,16 @@ class PrepareRuntimeTests(unittest.TestCase):
             execution_mode_for_plan(1, content_mode="monologue", duration_seconds=600),
             "single",
         )
+
+    def test_execution_mode_monologue_fast_path_collapses_two_short_chunks_to_single(self) -> None:
         self.assertEqual(
             execution_mode_for_plan(2, content_mode="monologue", duration_seconds=600),
+            "single",
+        )
+
+    def test_execution_mode_monologue_two_chunks_without_duration_stays_micro_multi(self) -> None:
+        self.assertEqual(
+            execution_mode_for_plan(2, content_mode="monologue", duration_seconds=0),
             "micro-multi",
         )
 
@@ -131,13 +139,40 @@ class PrepareRuntimeTests(unittest.TestCase):
         self.assertEqual(plan["contract"]["tldr_bounds"]["strategy"], "deterministic-merge")
         self.assertEqual(plan["assemble"]["blocked_by"], ["tldr"])
 
-    def test_build_execution_plan_keeps_required_speaker_stage_even_without_placeholders(self) -> None:
+    def test_build_execution_plan_skips_required_speaker_stage_without_labels(self) -> None:
         payload = {
             "execution_mode": "micro-multi",
             "content_mode": "conversation",
             "total_chunks": 4,
             "chunk_plan": [{"id": "A"}],
-            "files": [{"markers": 0}],
+            "files": [{"markers": 0, "speaker_label_cues": 0}],
+            "totals": {"speaker_markers": 0},
+            "prompt_packs": {},
+            "header_seed": {},
+            "note_contract": {},
+            "quality_checks": {},
+        }
+        chunk_statuses = {"A": {"status": "ready"}}
+        stages = {
+            "speaker_identification": {"hint": "required", "status": "missing"},
+            "extraction": {"status": "ready"},
+            "tldr": {"status": "missing"},
+            "assemble": {"status": "missing"},
+        }
+
+        plan = build_execution_plan(payload, chunk_statuses, stages)
+
+        self.assertFalse(plan["speaker_identification"]["should_run"])
+        self.assertNotIn("speaker_identification", plan["assemble"]["blocked_by"])
+        self.assertEqual(plan["next_action"], "generate-tldr")
+
+    def test_build_execution_plan_keeps_required_speaker_stage_with_speaker_labels(self) -> None:
+        payload = {
+            "execution_mode": "micro-multi",
+            "content_mode": "conversation",
+            "total_chunks": 4,
+            "chunk_plan": [{"id": "A"}],
+            "files": [{"markers": 0, "speaker_label_cues": 2}],
             "totals": {"speaker_markers": 0},
             "prompt_packs": {},
             "header_seed": {},
@@ -156,6 +191,7 @@ class PrepareRuntimeTests(unittest.TestCase):
 
         self.assertTrue(plan["speaker_identification"]["should_run"])
         self.assertIn("speaker_identification", plan["assemble"]["blocked_by"])
+        self.assertEqual(plan["next_action"], "speaker-identification")
 
 
 if __name__ == "__main__":

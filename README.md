@@ -121,6 +121,15 @@ mw models select parakeet-pro:nvidia_parakeet-v3
 
 When both are available, the runner can use Groq first and fall back to MacWhisper Parakeet on macOS if needed.
 
+To measure the local Parakeet path on a real file, run:
+
+```bash
+notes-runner audio /path/to/audio.mp3 --transcribe-backend parakeet --parakeet-benchmark --json
+```
+
+The bundle will contain `parakeet_telemetry.json`, and `run.json` will include the same timing data under `telemetry.parakeet`.
+If MacWhisper briefly reports a failed long-file transcription, the runner waits and retries once before falling back to 10-minute Parakeet chunks with merged global timestamps.
+
 ## Common Commands
 
 ```bash
@@ -138,6 +147,7 @@ Useful flags:
 | `--language en` | `audio`, `batch`, `youtube` | Set the transcription language hint. Default is `ru`. |
 | `--transcribe-backend groq` | `audio`, `batch` | Force Groq transcription. |
 | `--transcribe-backend parakeet` | `audio`, `batch` | Force MacWhisper Parakeet. |
+| `--parakeet-benchmark` | `audio` | Force Parakeet for the run and record local transcription timing telemetry. |
 | `--prepare` | all source commands | Run chunking and prompt preparation. |
 | `--refresh` | all source commands | Re-ingest or re-transcribe instead of reusing cached state. |
 

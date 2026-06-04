@@ -16,6 +16,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNER_PATH = REPO_ROOT / "scripts" / "notes-runner"
 FIXTURES_DIR = REPO_ROOT / "test-fixtures"
+TRANSCRIBE_BACKENDS_MODULE = "notes_runner_lib.transcribe_backends_runtime"
 
 
 def load_runner_module() -> types.ModuleType:
@@ -107,8 +108,8 @@ class NotesRunnerRegressionTests(unittest.TestCase):
             audio_path = Path(tmp_dir) / "sample.mp3"
             audio_path.write_bytes(b"audio")
             json_out = Path(tmp_dir) / "out.json"
-            with mock.patch.object(self.runner.shutil, "which", return_value="/usr/local/bin/mw"):
-                with mock.patch.object(self.runner, "run_checked", side_effect=fake_run_checked):
+            with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.shutil.which", return_value="/usr/local/bin/mw"):
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.run_checked", side_effect=fake_run_checked):
                     result = self.runner.call_parakeet_transcribe(
                         audio_path,
                         language="ru",
@@ -121,6 +122,145 @@ class NotesRunnerRegressionTests(unittest.TestCase):
         self.assertEqual(captured["label"], "MacWhisper Parakeet transcription")
         self.assertIn("parakeet-pro:nvidia_parakeet-v3", command)
         self.assertIn("--quiet", command)
+
+    def test_call_parakeet_transcribe_writes_telemetry_sidecar(self) -> None:
+        def fake_run_checked(command: list[str], *, label: str) -> object:
+            md_out = Path(command[command.index("--md-out") + 1])
+            json_out = Path(command[command.index("--json-out") + 1])
+            md_out.write_text("*00:00* тест\n", encoding="utf-8")
+            json_out.write_text("{}", encoding="utf-8")
+            return types.SimpleNamespace(stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = Path(tmp_dir) / "sample.mp3"
+            audio_path.write_bytes(b"audio")
+            json_out = Path(tmp_dir) / "out.json"
+            telemetry_path = Path(tmp_dir) / "parakeet-telemetry.json"
+            with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.shutil.which", return_value="/usr/local/bin/mw"):
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.run_checked", side_effect=fake_run_checked):
+                    result = self.runner.call_parakeet_transcribe(
+                        audio_path,
+                        language="ru",
+                        json_output_path=json_out,
+                        telemetry_output_path=telemetry_path,
+                    )
+
+            telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, "*00:00* тест\n")
+        self.assertEqual(telemetry["backend"], "macwhisper_parakeet")
+        self.assertEqual(telemetry["model"], "parakeet-pro:nvidia_parakeet-v3")
+        self.assertEqual(telemetry["language"], "ru")
+        self.assertFalse(telemetry["normalized_audio"])
+        self.assertGreaterEqual(telemetry["total_ms"], 0)
+        self.assertGreaterEqual(telemetry["transcribe_ms"], 0)
+        self.assertEqual(telemetry["source_path"], str(audio_path))
+
+    def test_call_parakeet_transcribe_falls_back_to_chunked_parakeet(self) -> None:
+        def fake_run_checked(command: list[str], *, label: str) -> object:
+            transcribed_path = Path(command[2])
+            if transcribed_path.name == "sample.mp3":
+                raise ValueError("MacWhisper Parakeet transcription failed: MacWhisper reported a failed transcription")
+            md_out = Path(command[command.index("--md-out") + 1])
+            json_out = Path(command[command.index("--json-out") + 1])
+            chunk_number = 1 if transcribed_path.name.endswith("001.m4a") else 0
+            md_out.write_text(f"*00:00* chunk {chunk_number}\n", encoding="utf-8")
+            json_out.write_text(
+                json.dumps(
+                    {
+                        "text": f"chunk {chunk_number}",
+                        "duration_seconds": 600,
+                        "transcription_seconds": 10,
+                        "segments": [
+                            {
+                                "start_ms": 1000,
+                                "end_ms": 2000,
+                                "speaker": "Speaker 1",
+                                "text": f"chunk {chunk_number}",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return types.SimpleNamespace(stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = Path(tmp_dir) / "sample.mp3"
+            audio_path.write_bytes(b"audio")
+            chunk_0 = Path(tmp_dir) / "parakeet_chunk_000.m4a"
+            chunk_1 = Path(tmp_dir) / "parakeet_chunk_001.m4a"
+            chunk_0.write_bytes(b"chunk")
+            chunk_1.write_bytes(b"chunk")
+            json_out = Path(tmp_dir) / "merged.json"
+            telemetry_path = Path(tmp_dir) / "parakeet-telemetry.json"
+            with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.shutil.which", return_value="/usr/local/bin/mw"):
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.PARAKEET_FAILURE_SETTLE_SECONDS", 0):
+                    with mock.patch(
+                        f"{TRANSCRIBE_BACKENDS_MODULE}._split_audio_for_parakeet",
+                        return_value=[(chunk_0, 0.0), (chunk_1, 600.0)],
+                    ):
+                        with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.run_checked", side_effect=fake_run_checked):
+                            result = self.runner.call_parakeet_transcribe(
+                                audio_path,
+                                language="ru",
+                                json_output_path=json_out,
+                                telemetry_output_path=telemetry_path,
+                            )
+
+            merged_json = json.loads(json_out.read_text(encoding="utf-8"))
+            telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+
+        self.assertIn("**Speaker 1**: chunk 0", result)
+        self.assertIn("*10:01*", result)
+        self.assertEqual(merged_json["segments"][1]["start_ms"], 601000)
+        self.assertEqual(telemetry["mode"], "chunked_fallback")
+        self.assertEqual(len(telemetry["chunks"]), 2)
+        self.assertIn("failed transcription", telemetry["full_attempt_error"])
+
+    def test_call_parakeet_transcribe_retries_transient_failed_status_before_chunking(self) -> None:
+        calls: list[str] = []
+
+        def fake_run_checked(command: list[str], *, label: str) -> object:
+            calls.append(Path(command[2]).name)
+            if len(calls) == 1:
+                raise ValueError("MacWhisper Parakeet transcription failed: MacWhisper reported a failed transcription")
+            md_out = Path(command[command.index("--md-out") + 1])
+            json_out = Path(command[command.index("--json-out") + 1])
+            md_out.write_text("*00:00* retry success\n", encoding="utf-8")
+            json_out.write_text(
+                json.dumps(
+                    {
+                        "text": "retry success",
+                        "duration_seconds": 60,
+                        "transcription_seconds": 7,
+                        "segments": [{"start_ms": 0, "end_ms": 1000, "text": "retry success"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return types.SimpleNamespace(stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = Path(tmp_dir) / "sample.mp3"
+            audio_path.write_bytes(b"audio")
+            telemetry_path = Path(tmp_dir) / "parakeet-telemetry.json"
+            with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.shutil.which", return_value="/usr/local/bin/mw"):
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.PARAKEET_FAILURE_SETTLE_SECONDS", 0):
+                    with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}._split_audio_for_parakeet") as split_audio:
+                        with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.run_checked", side_effect=fake_run_checked):
+                            result = self.runner.call_parakeet_transcribe(
+                                audio_path,
+                                language="ru",
+                                telemetry_output_path=telemetry_path,
+                            )
+            telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+
+        split_audio.assert_not_called()
+        self.assertEqual(result, "*00:00* retry success\n")
+        self.assertEqual(calls, ["sample.mp3", "sample.mp3"])
+        self.assertEqual(telemetry["mode"], "whole_file_retry")
+        self.assertEqual(telemetry["macwhisper_transcription_seconds"], 7)
 
     def test_call_parakeet_transcribe_normalizes_ogg_before_macwhisper(self) -> None:
         captured: dict[str, object] = {}
@@ -147,14 +287,15 @@ class NotesRunnerRegressionTests(unittest.TestCase):
             audio_path = Path(tmp_dir) / "sample.ogg"
             audio_path.write_bytes(b"ogg")
             json_out = Path(tmp_dir) / "out.json"
-            with mock.patch.object(self.runner.shutil, "which", return_value="/usr/local/bin/mw"):
-                with mock.patch.object(self.runner.subprocess, "run", side_effect=fake_ffmpeg_run):
-                    with mock.patch.object(self.runner, "run_checked", side_effect=fake_run_checked):
-                        result = self.runner.call_parakeet_transcribe(
-                            audio_path,
-                            language="ru",
-                            json_output_path=json_out,
-                        )
+            with mock.patch.dict(self.runner.os.environ, {"NOTES_MACWHISPER_NORMALIZED_CACHE": str(Path(tmp_dir) / "cache")}, clear=False):
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.shutil.which", return_value="/usr/local/bin/mw"):
+                    with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.subprocess.run", side_effect=fake_ffmpeg_run):
+                        with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.run_checked", side_effect=fake_run_checked):
+                            result = self.runner.call_parakeet_transcribe(
+                                audio_path,
+                                language="ru",
+                                json_output_path=json_out,
+                            )
 
         self.assertEqual(result, "*00:00* тест\n")
         self.assertEqual(captured["label"], "MacWhisper Parakeet transcription")
@@ -164,14 +305,37 @@ class NotesRunnerRegressionTests(unittest.TestCase):
         self.assertIn("aac", captured["ffmpeg_command"])
         self.assertNotEqual(Path(captured["mw_command"][2]), audio_path)
 
+    def test_normalize_audio_for_macwhisper_reuses_cached_m4a(self) -> None:
+        ffmpeg_calls = 0
+
+        def fake_ffmpeg_run(command: list[str], **_: object) -> object:
+            nonlocal ffmpeg_calls
+            ffmpeg_calls += 1
+            Path(command[-1]).write_bytes(b"m4a")
+            return types.SimpleNamespace(stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            audio_path = Path(tmp_dir) / "sample.ogg"
+            audio_path.write_bytes(b"same audio")
+            cache_dir = Path(tmp_dir) / "cache"
+            with mock.patch.dict(self.runner.os.environ, {"NOTES_MACWHISPER_NORMALIZED_CACHE": str(cache_dir)}, clear=False):
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.subprocess.run", side_effect=fake_ffmpeg_run):
+                    first = self.runner.normalize_audio_for_macwhisper(audio_path, Path(tmp_dir) / "tmp1")
+                    second = self.runner.normalize_audio_for_macwhisper(audio_path, Path(tmp_dir) / "tmp2")
+
+            self.assertEqual(first, second)
+            self.assertEqual(ffmpeg_calls, 1)
+            self.assertTrue(first.is_file())
+            self.assertEqual(first.parent, cache_dir)
+
     def test_groq_preflight_skips_audio_at_hourly_audio_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             audio_path = Path(tmp_dir) / "long.mp3"
             audio_path.write_bytes(b"audio")
             raw_output_path = Path(tmp_dir) / "groq.json"
             with mock.patch.dict(self.runner.os.environ, {"GROQ_API_KEY": "test-key"}, clear=True):
-                with mock.patch.object(self.runner, "probe_media_duration_seconds", return_value=7200):
-                    with mock.patch.object(self.runner, "_groq_transcribe_single") as groq_call:
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.probe_media_duration_seconds", return_value=7200):
+                    with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}._groq_transcribe_single") as groq_call:
                         with self.assertRaises(self.runner.RateLimitError) as exc:
                             self.runner.call_groq_transcribe(audio_path, raw_output_path, language="ru")
 
@@ -213,7 +377,7 @@ class NotesRunnerRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             audio_path = Path(tmp_dir) / "sample.mp3"
             audio_path.write_bytes(b"audio")
-            with mock.patch.object(self.runner.subprocess, "run", side_effect=fake_run):
+            with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.subprocess.run", side_effect=fake_run):
                 with self.assertRaises(self.runner.RateLimitError) as exc:
                     self.runner._groq_transcribe_single(audio_path, api_key="test-key", language="ru")
 
@@ -491,7 +655,7 @@ class NotesRunnerRegressionTests(unittest.TestCase):
 
     def test_choose_transcribe_backend_ignores_elevenlabs_env(self) -> None:
         with mock.patch.dict(self.runner.os.environ, {"ELEVENLABS_API_KEY": "test-key"}, clear=True):
-            with mock.patch.object(self.runner, "is_macos", return_value=False):
+            with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.is_macos", return_value=False):
                 with self.assertRaises(ValueError) as exc:
                     self.runner.choose_transcribe_backend("auto")
 
@@ -500,8 +664,8 @@ class NotesRunnerRegressionTests(unittest.TestCase):
 
     def test_choose_transcribe_backend_uses_macwhisper_parakeet_on_macos(self) -> None:
         with mock.patch.dict(self.runner.os.environ, {}, clear=True):
-            with mock.patch.object(self.runner, "is_macos", return_value=True):
-                with mock.patch.object(self.runner, "parakeet_available", return_value=True):
+            with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.is_macos", return_value=True):
+                with mock.patch(f"{TRANSCRIBE_BACKENDS_MODULE}.parakeet_available", return_value=True):
                     self.assertEqual(self.runner.choose_transcribe_backend("auto"), "parakeet")
 
     def test_execution_mode_routes_five_chunk_conversation_to_micro_multi(self) -> None:
@@ -520,6 +684,115 @@ class NotesRunnerRegressionTests(unittest.TestCase):
         parser = self.runner.build_parser()
         args = parser.parse_args(["audio", "/tmp/a.mp3", "--transcribe-backend", "parakeet"])
         self.assertEqual(args.transcribe_backend, "parakeet")
+
+    def test_parser_accepts_parakeet_benchmark_mode(self) -> None:
+        parser = self.runner.build_parser()
+        args = parser.parse_args(["audio", "/tmp/a.mp3", "--parakeet-benchmark"])
+        self.assertTrue(args.parakeet_benchmark)
+
+    def test_audio_parakeet_benchmark_records_bundle_telemetry(self) -> None:
+        captured: dict[str, object] = {}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "sample.mp3"
+            source_path.write_bytes(b"audio")
+            output_root = Path(tmp_dir) / "out"
+
+            def fake_call_parakeet_transcribe(
+                audio_path: Path,
+                *,
+                language: str | None,
+                json_output_path: Path,
+                telemetry_output_path: Path,
+            ) -> str:
+                captured["audio_path"] = audio_path
+                captured["language"] = language
+                captured["json_output_path"] = json_output_path
+                captured["telemetry_output_path"] = telemetry_output_path
+                json_output_path.write_text("{}", encoding="utf-8")
+                self.runner.write_json(
+                    telemetry_output_path,
+                    {
+                        "backend": "macwhisper_parakeet",
+                        "model": "parakeet-pro:nvidia_parakeet-v3",
+                        "language": language or "auto",
+                        "source_path": str(audio_path),
+                        "normalized_audio": False,
+                        "transcribe_ms": 1234,
+                        "total_ms": 1300,
+                    },
+                )
+                return "*00:00* тест\n"
+
+            deps = self.runner.AudioCommandDependencies(
+                ensure_file=lambda path, _label: path,
+                ensure_parent_dir=lambda path: path.mkdir(parents=True, exist_ok=True) or path,
+                humanize_path_title_hint=lambda value: value,
+                audio_extensions={".mp3"},
+                video_extensions=set(),
+                extract_audio_from_video=lambda _path, _output_dir: (_ for _ in ()).throw(AssertionError("unexpected video extraction")),
+                local_bundle_dir_for=lambda _path, title, root: root / title,
+                bundle_paths=self.runner.bundle_paths,
+                start_bundle_run=self.runner.start_bundle_run,
+                write_json=self.runner.write_json,
+                load_json=self.runner.load_json,
+                whisper_json_to_transcript_markdown=self.runner.whisper_json_to_transcript_markdown,
+                write_text=self.runner.write_text,
+                normalize_transcript_text=self.runner.normalize_transcript_text,
+                probe_media_duration_seconds=lambda _path: 60,
+                choose_transcribe_backend=lambda choice: choice,
+                normalize_language_hint=self.runner.normalize_language_hint,
+                call_groq_transcribe=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected groq call")),
+                groq_payload_to_transcript_markdown=self.runner.groq_payload_to_transcript_markdown,
+                groq_rate_limit_error=self.runner.RateLimitError,
+                is_macos=lambda: True,
+                parakeet_available=lambda: True,
+                mlx_whisper_available=lambda: False,
+                ensure_audio_transcription_available=lambda _name: None,
+                local_backend_language=self.runner.local_backend_language,
+                run_whisperx_diarize=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected whisperx call")),
+                whisperx_json_to_transcript_markdown=self.runner.whisperx_json_to_transcript_markdown,
+                run_mlx_whisper=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected mlx call")),
+                call_parakeet_transcribe=fake_call_parakeet_transcribe,
+                call_transcribe_helper=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected helper call")),
+                transcript_markdown_from_api_payload=self.runner.transcript_markdown_from_api_payload,
+                run_prepare_and_attach=lambda *_args, **_kwargs: {},
+                extract_prepare_duration_ms=self.runner.extract_prepare_duration_ms,
+                write_bundle_state_snapshot=self.runner.write_bundle_state_snapshot,
+                append_trace_event=self.runner.append_trace_event,
+                finish_bundle_run=self.runner.finish_bundle_run,
+                ms_since=self.runner.ms_since,
+                stderr=StringIO(),
+            )
+            args = argparse.Namespace(
+                path=str(source_path),
+                output_root=str(output_root),
+                title=None,
+                model="mlx-community/whisper-large-v3-turbo",
+                language="ru",
+                prepare=False,
+                refresh=False,
+                transcribe_backend="auto",
+                diarize=False,
+                parakeet_benchmark=True,
+                json=True,
+            )
+
+            stdout = StringIO()
+            with contextlib.redirect_stdout(stdout):
+                exit_code = self.runner.run_audio_command(args, deps=deps)
+
+            payload = json.loads(stdout.getvalue())
+            bundle_dir = Path(payload["bundle_dir"])
+            state = json.loads((bundle_dir / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["audio_path"], source_path)
+        self.assertEqual(Path(captured["telemetry_output_path"]).name, "parakeet_telemetry.json")
+        self.assertEqual(payload["transcript_source"]["telemetry"]["transcribe_ms"], 1234)
+        self.assertEqual(payload["parakeet_benchmark"]["mode"], "whole_file_baseline")
+        self.assertEqual(state["telemetry"]["parakeet"]["total_ms"], 1300)
+        self.assertEqual(state["parakeet_benchmark"]["telemetry"]["transcribe_ms"], 1234)
 
     def test_batch_binary_markdown_writes_index_and_trace_instead_of_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

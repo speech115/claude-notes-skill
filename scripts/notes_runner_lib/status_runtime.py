@@ -8,7 +8,6 @@ from .prepare_runtime import (
     build_chunk_statuses,
     build_execution_plan,
     build_stage_statuses,
-    determine_next_action,
     find_prepare_state_path,
     load_prepare_payload,
     note_contract_path,
@@ -134,7 +133,7 @@ def build_status_payload(work_dir: Path) -> dict:
         "bundle_latest_run_id": bundle_state.get("latest_run_id"),
         "bundle_latest_status": bundle_state.get("latest_status"),
         "bundle_latest_run_snapshot": bundle_state.get("latest_run_snapshot"),
-        "next_action": determine_next_action(stages),
+        "next_action": None,
         "counts": {
             "block_files": len(block_files),
             "manifest_parts": len(manifest_parts),
@@ -157,4 +156,5 @@ def build_status_payload(work_dir: Path) -> dict:
         },
     }
     payload["execution_plan"] = build_execution_plan(prepare_payload, chunk_statuses, stages)
+    payload["next_action"] = payload["execution_plan"]["next_action"]
     return payload

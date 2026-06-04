@@ -189,6 +189,12 @@ def build_parser(
         default=False,
         help="Run speaker diarization via whisperx (requires whisperx installed).",
     )
+    audio_parser.add_argument(
+        "--parakeet-benchmark",
+        action="store_true",
+        default=False,
+        help="Record MacWhisper Parakeet timing telemetry for speed comparisons.",
+    )
     audio_parser.add_argument("--json", action="store_true", default=False, help="Emit JSON summary.")
 
     telegram_parser = subparsers.add_parser(

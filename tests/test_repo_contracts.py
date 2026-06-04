@@ -90,9 +90,8 @@ RUNNER_COMPAT_ATTRS = [
 ]
 EXPECTED_RUNNER_RUNTIME_MODULES = [
     "appendix_runtime",
-    "assemble_finalize_runtime",
+    "assemble_command_runtime",
     "assemble_runtime",
-    "assemble_shell_runtime",
     "audio_command_runtime",
     "auto_command_runtime",
     "batch_command_runtime",
@@ -110,6 +109,7 @@ EXPECTED_RUNNER_RUNTIME_MODULES = [
     "prepare_bundle_runtime",
     "prepare_command_runtime",
     "prepare_logic_runtime",
+    "prepare_pipeline_runtime",
     "prepare_runtime",
     "prepare_transcript_runtime",
     "quality_runtime",
@@ -118,9 +118,9 @@ EXPECTED_RUNNER_RUNTIME_MODULES = [
     "source_ingest_runtime",
     "speaker_runtime",
     "status_runtime",
-    "telegram_assemble_runtime",
     "telegram_command_runtime",
     "tldr_runtime",
+    "transcribe_backends_runtime",
     "transcript_runtime",
     "workdir_command_runtime",
     "youtube_command_runtime",
@@ -200,7 +200,7 @@ class RepoContractTests(unittest.TestCase):
             for action in audio._actions
             for option in getattr(action, "option_strings", [])
         }
-        for option in ("--output-root", "--title", "--model", "--language", "--prepare", "--refresh", "--transcribe-backend", "--diarize", "--json"):
+        for option in ("--output-root", "--title", "--model", "--language", "--prepare", "--refresh", "--transcribe-backend", "--diarize", "--parakeet-benchmark", "--json"):
             self.assertIn(option, audio_options)
 
     def test_runner_help_surface_lists_public_commands(self) -> None:

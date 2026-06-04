@@ -35,8 +35,7 @@ class TelegramCommandDependencies:
     call_parakeet_transcribe: Callable[..., str]
     run_mlx_whisper: Callable[..., Path]
     whisper_json_to_transcript_markdown: Callable[[Path], str]
-    run_prepare_for_transcript: Callable[..., dict]
-    attach_prepare_outputs: Callable[[dict[str, object], dict, Path], None]
+    run_prepare_and_attach: Callable[..., dict]
     ms_since: Callable[[float], int]
     extract_prepare_duration_ms: Callable[[dict | None], int]
     write_bundle_state_snapshot: Callable[[Path, dict], dict]
@@ -183,8 +182,12 @@ def run_telegram_command(args: argparse.Namespace, *, deps: TelegramCommandDepen
         }
 
         if args.prepare:
-            prepare_payload = deps.run_prepare_for_transcript(transcript_path, bundle_dir=bundle_dir, refresh=args.refresh)
-            deps.attach_prepare_outputs(payload, prepare_payload, bundle_dir)
+            deps.run_prepare_and_attach(
+                payload,
+                transcript_path,
+                bundle_dir,
+                refresh=args.refresh,
+            )
 
         transcription_duration_ms = deps.ms_since(command_started)
         prepare_ms = deps.extract_prepare_duration_ms(payload.get("prepare") if isinstance(payload.get("prepare"), dict) else None)

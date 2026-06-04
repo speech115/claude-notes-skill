@@ -12,6 +12,7 @@ from typing import Callable
 
 
 SPEAKER_MARKER_RE = re.compile(r"\*\*Speaker\s+(\d+)\*\*")
+DIALOGUE_SPEAKER_LABEL_RE = re.compile(r"^\s*(?:\*\*)?Speaker\s+\d+(?:\*\*)?\s*:", re.IGNORECASE)
 DIALOGUE_PREFIX_RE = re.compile(r"^\s*(?:\*\*)?(?:[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 .,_\-]{0,40})(?:\*\*)?\s*:")
 DIALOGUE_SPEAKER_RE = re.compile(r"^\s*(?:\*\*)?([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9 .,_\-]{0,40})(?:\*\*)?\s*:")
 INTRO_RE = re.compile(
@@ -39,6 +40,7 @@ class FileMeta:
     markers: int
     dialogue_cues: int
     dialogue_speakers: int
+    speaker_label_cues: int
     intro_cues: int
     clues: list[str]
     duration_estimate: str | None
@@ -131,6 +133,7 @@ def _prepare_detect_file_meta(path: Path) -> FileMeta:
     joined = "\n".join(lines)
     marker_matches = SPEAKER_MARKER_RE.findall(joined)
     dialogue_cues = sum(1 for line in lines if DIALOGUE_PREFIX_RE.match(line))
+    speaker_label_cues = sum(1 for line in lines if DIALOGUE_SPEAKER_LABEL_RE.match(line))
     dialogue_speakers = {
         match.group(1).strip(" *_")
         for line in lines
@@ -158,6 +161,7 @@ def _prepare_detect_file_meta(path: Path) -> FileMeta:
         markers=len(set(marker_matches)),
         dialogue_cues=dialogue_cues,
         dialogue_speakers=len(dialogue_speakers),
+        speaker_label_cues=speaker_label_cues,
         intro_cues=intro_cues,
         clues=clues,
         duration_estimate=_prepare_last_timestamp(lines),
@@ -607,6 +611,7 @@ def execution_mode_for_total_chunks(total_chunks: int, *, deps: PrepareLogicDepe
 def _prepare_render_speaker_prompt(work_dir: Path, *, deps: PrepareLogicDependencies) -> str:
     sentinel_path = deps.stage_sentinel_path(work_dir, "speaker-identification")
     return (
+        "This prompt is complete. Do not read SKILL.md, README.md, AGENTS.md, or repo docs unless a required file below is missing.\n\n"
         f"Read {work_dir / 'prescan_context.txt'} and {work_dir / deps.header_seed_filename} and identify speakers.\n\n"
         f"WORK_DIR: {work_dir}\n"
         f"OUTPUT: {work_dir / 'speakers.txt'}\n"
@@ -687,6 +692,7 @@ def _prepare_render_extraction_prompt(
             "- Because this is single-mode, also write tldr.md as a numbered list of 5-8 key takeaways in Russian.\n"
         )
     return (
+        "This prompt is complete. Do not read SKILL.md, README.md, AGENTS.md, or repo docs unless a required file below is missing.\n\n"
         "You are an extraction agent creating detailed study notes.\n\n"
         f"WORK_DIR: {work_dir}\n"
         f"CHUNK_ID: {chunk_id}\n"
@@ -780,6 +786,7 @@ def _prepare_render_extraction_prompt(
 def _prepare_render_tldr_prompt(work_dir: Path, *, deps: PrepareLogicDependencies) -> str:
     sentinel_path = deps.stage_sentinel_path(work_dir, "tldr")
     return (
+        "This prompt is complete. Do not read SKILL.md, README.md, AGENTS.md, or repo docs unless a required file below is missing.\n\n"
         "Read all summary_chunk_*.md files in $WORK_DIR (sorted), plus the note contract and block manifests.\n\n"
         f"WORK_DIR: {work_dir}\n"
         f"NOTE CONTRACT: {deps.note_contract_path(work_dir)}\n"
@@ -881,6 +888,7 @@ def _prepare_render_header_prompt(work_dir: Path, *, deps: PrepareLogicDependenc
     )
     topic_hint_block = f"Topic hint: {topic_hint}\n" if topic_hint else ""
     return (
+        "This prompt is complete. Do not read SKILL.md, README.md, AGENTS.md, or repo docs unless a required file below is missing.\n\n"
         f"Read {work_dir / deps.header_seed_filename}, {deps.note_contract_path(work_dir)} and {work_dir / 'tldr.md'} if it exists.\n"
         f"Use {work_dir / 'prescan_context.txt'} only as a fallback for disambiguation.\n"
         f"Write {work_dir / 'header.md'} using the header seed, note contract and TL;DR.\n"
@@ -1110,6 +1118,7 @@ def run_prepare_logic(
                 "markers": item.markers,
                 "dialogue_cues": item.dialogue_cues,
                 "dialogue_speakers": item.dialogue_speakers,
+                "speaker_label_cues": item.speaker_label_cues,
                 "intro_cues": item.intro_cues,
                 "duration_estimate": item.duration_estimate,
             }
@@ -1122,6 +1131,7 @@ def run_prepare_logic(
             "estimated_tokens": sum(item.estimated_tokens for item in meta),
             "speaker_markers": sum(item.markers for item in meta),
             "dialogue_speakers": sum(item.dialogue_speakers for item in meta),
+            "speaker_label_cues": sum(item.speaker_label_cues for item in meta),
         },
         "artifacts": {
             "report": str(work_dir / "prepare_report.txt"),

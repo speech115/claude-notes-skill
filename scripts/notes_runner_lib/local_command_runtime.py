@@ -23,8 +23,7 @@ class LocalCommandDependencies:
     write_json: Callable[[Path, object], None]
     normalize_transcript_text: Callable[[str], str]
     read_text_file: Callable[[Path], str]
-    run_prepare_for_transcript: Callable[..., dict]
-    attach_prepare_outputs: Callable[[dict[str, object], dict, Path], None]
+    run_prepare_and_attach: Callable[..., dict]
     extract_prepare_duration_ms: Callable[[dict | None], int]
     write_bundle_state_snapshot: Callable[[Path, dict], dict]
     append_trace_event: Callable[..., object]
@@ -104,12 +103,12 @@ def run_local_command(args: argparse.Namespace, *, deps: LocalCommandDependencie
         }
 
         if args.prepare:
-            prepare_payload = deps.run_prepare_for_transcript(
+            deps.run_prepare_and_attach(
+                payload,
                 transcript_path,
-                bundle_dir=bundle_dir,
+                bundle_dir,
                 refresh=args.refresh,
             )
-            deps.attach_prepare_outputs(payload, prepare_payload, bundle_dir)
 
         source_acquisition_ms = deps.ms_since(command_started)
         prepare_ms = deps.extract_prepare_duration_ms(

@@ -85,8 +85,9 @@ class LocalCommandRuntimeTests(unittest.TestCase):
                     write_json=fake_write_json,
                     normalize_transcript_text=lambda text: text.strip(),
                     read_text_file=lambda path: path.read_text(encoding="utf-8"),
-                    run_prepare_for_transcript=lambda transcript, *, bundle_dir, refresh: {"work_dir": str(bundle_dir / "work")},
-                    attach_prepare_outputs=lambda payload, prepare_payload, bundle: payload.update({"prepare": prepare_payload}),
+                    run_prepare_and_attach=lambda payload, transcript, bundle_dir, *, refresh=False, source_hints=None: payload.update(
+                        {"prepare": {"work_dir": str(bundle_dir / "work")}}
+                    ),
                     ms_since=lambda started: 12,
                     extract_prepare_duration_ms=lambda payload: 0,
                     write_bundle_state_snapshot=fake_write_bundle_state_snapshot,

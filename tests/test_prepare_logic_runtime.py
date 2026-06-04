@@ -126,6 +126,17 @@ class PrepareLogicRuntimeTests(unittest.TestCase):
             self.assertEqual(meta[0].path, transcript.resolve())
             self.assertEqual(meta[0].lines, 2)
             self.assertEqual(len(fingerprint), 12)
+            self.assertEqual(meta[0].speaker_label_cues, 0)
+
+    def test_prepare_fingerprint_counts_speaker_label_cues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            transcript = Path(tmp_dir) / "transcript.md"
+            transcript.write_text("**Speaker 1**: hello\n*00:01*\nSpeaker 2: world\n", encoding="utf-8")
+
+            meta, _fingerprint = prepare_fingerprint_for_files([transcript], deps=self._deps(trace_events=[]))
+
+            self.assertEqual(meta[0].markers, 1)
+            self.assertEqual(meta[0].speaker_label_cues, 2)
 
     def test_run_prepare_logic_writes_core_artifacts_and_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -217,6 +228,7 @@ class PrepareLogicRuntimeTests(unittest.TestCase):
             result = run_prepare_logic([transcript], deps=self._deps(trace_events=[]))
 
             extraction_prompt = (Path(result["work_dir"]) / "prompts" / "extract-A.md").read_text(encoding="utf-8")
+            self.assertIn("This prompt is complete.", extraction_prompt)
             self.assertIn("for example: `Проверь: ...`", extraction_prompt)
             self.assertIn('"started_at": "<ISO8601>"', extraction_prompt)
             self.assertNotIn("Ответь себе на вопрос", extraction_prompt)
