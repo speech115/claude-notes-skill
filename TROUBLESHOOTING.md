@@ -49,6 +49,20 @@ NOTES_RUNNER_DISABLE_TELEGRAM=1 python3 scripts/notes-runner assemble "$WORK_DIR
 
 Это debug-only ветка. Для нормального пользовательского `/notes` финал считается закрытым только после успешной Telegram-доставки.
 
+## `telegram_delivery.success == false` с `Unknown tool: send_file`
+
+Сборка конспекта прошла, но `assemble` вернул ошибку доставки. Обычно это не баг `notes-runner`, а профиль локального Telegram MCP.
+
+Проверь:
+
+- `mcporter list telegram` содержит `send_file`
+- `config.json` указывает на рабочий `mcp_url` (часто `http://127.0.0.1:8799/mcp`)
+- `NOTES_RUNNER_DIGEST_RUNNER` резолвится в рабочий `digest-runner`
+
+Если `send_file` нет в списке tools, перезапусти HTTP daemon `telegram-mcp` после обновления (facade-профиль должен экспортировать `send_file` для `digest-runner send-file`). После рестарта повтори `assemble` без `--skip-telegram`.
+
+Локальные черновики и benchmark-отчёты в `drafts/` и `outputs/` git не отслеживает — это нормально и не мешает `promote-live`.
+
 ## `promote-live` отказался работать
 
 Чаще всего это не баг, а dirty tree.

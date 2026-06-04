@@ -93,6 +93,7 @@ export NOTES_RUNNER_DIGEST_RUNNER=/absolute/path/to/digest-runner
 
 3. Copy `config.example.json` to your installed skill's `config.json`, then set `"enabled": true` and your own chat target.
    If you are on Codex-first install layout, this is usually `~/.codex/skills/notes/config.json`.
+4. Confirm the Telegram MCP HTTP daemon exposes `send_file` (`mcporter list telegram`). `digest-runner send-file` depends on it.
 
 Example:
 
