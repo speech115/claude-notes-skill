@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_PATH="${NOTES_SKILL_ROOT:-$SKILL_ROOT}/config.json"
+
+TARGET="$(
+  python3 - "$CONFIG_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+if not config_path.is_file():
+    raise SystemExit(0)
+
+payload = json.loads(config_path.read_text(encoding="utf-8"))
+if not isinstance(payload, dict):
+    raise SystemExit(0)
+
+candidates = []
+top = payload.get("digest_runner")
+if isinstance(top, str) and top.strip():
+    candidates.append(top.strip())
+
+delivery = payload.get("telegram_delivery")
+if isinstance(delivery, dict):
+    nested = delivery.get("digest_runner")
+    if isinstance(nested, str) and nested.strip():
+        candidates.append(nested.strip())
+
+for value in candidates:
+    path = Path(value).expanduser()
+    if path.is_file():
+        print(path)
+        raise SystemExit(0)
+PY
+)"
+
+if [[ -z "${TARGET:-}" ]]; then
+  echo "digest-runner: set telegram_delivery.digest_runner in ${CONFIG_PATH}" >&2
+  exit 1
+fi
+
+exec "$TARGET" "$@"

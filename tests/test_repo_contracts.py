@@ -99,6 +99,7 @@ EXPECTED_RUNNER_RUNTIME_MODULES = [
     "bundle_runtime",
     "cli_runtime",
     "common",
+    "digest_runner_runtime",
     "doctor_command_runtime",
     "doctor_runtime",
     "header_runtime",
@@ -233,6 +234,7 @@ class RepoContractTests(unittest.TestCase):
             "ffmpeg",
             "skill_root",
             "telegram_delivery_enabled",
+            "digest_runner",
             "audio_transcription_ready",
         ):
             self.assertIn(key, payload)

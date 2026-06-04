@@ -3,6 +3,7 @@
     "enabled": false,
     "chat": "@your_channel_or_chat_id",
     "mcp_url": "http://127.0.0.1:8799/mcp",
-    "parse_mode": "md"
+    "parse_mode": "md",
+    "digest_runner": "/absolute/path/to/digest-runner"
   }
 }

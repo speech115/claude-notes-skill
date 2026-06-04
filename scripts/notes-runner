@@ -189,6 +189,7 @@ from notes_runner_lib.source_ingest_runtime import (
     run_checked,
     run_command,
 )
+from notes_runner_lib.digest_runner_runtime import resolve_digest_runner_path
 from notes_runner_lib.doctor_runtime import (
     build_doctor_checks,
     render_doctor_report,
@@ -397,23 +398,37 @@ def ensure_parent_dir(path: Path) -> Path:
 
 
 def resolve_digest_runner() -> Path:
-    override = os.environ.get("NOTES_RUNNER_DIGEST_RUNNER")
-    if override:
-        resolved = Path(override).expanduser()
-        if not resolved.is_file():
-            raise FileNotFoundError(f"NOTES_RUNNER_DIGEST_RUNNER points to a missing file: {resolved}")
-        return resolved
-
-    found = shutil.which("digest-runner")
-    if found:
-        return Path(found)
-
-    raise FileNotFoundError(
-        advanced_setup_message(
-            "Telegram delivery",
-            "Install a compatible digest-runner and set NOTES_RUNNER_DIGEST_RUNNER if it is not in PATH",
+    try:
+        return resolve_digest_runner_path(
+            config_path=NOTES_CONFIG_PATH,
+            skill_root=NOTES_SKILL_ROOT,
         )
-    )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            advanced_setup_message(
+                "Telegram delivery",
+                str(exc),
+            )
+        ) from exc
+
+
+def bootstrap_runner_environment() -> None:
+    bin_dir = NOTES_SKILL_ROOT / "bin"
+    if bin_dir.is_dir():
+        bin_path = str(bin_dir)
+        current_path = os.environ.get("PATH", "")
+        if bin_path not in current_path.split(os.pathsep):
+            os.environ["PATH"] = f"{bin_path}{os.pathsep}{current_path}" if current_path else bin_path
+    if os.environ.get("NOTES_RUNNER_DIGEST_RUNNER"):
+        return
+    try:
+        resolved = resolve_digest_runner_path(
+            config_path=NOTES_CONFIG_PATH,
+            skill_root=NOTES_SKILL_ROOT,
+        )
+    except FileNotFoundError:
+        return
+    os.environ["NOTES_RUNNER_DIGEST_RUNNER"] = str(resolved)
 
 
 def slugify(value: str, *, max_length: int = 72) -> str:
@@ -1661,6 +1676,7 @@ def command_handlers() -> dict[str, CommandHandler]:
 
 
 def main() -> int:
+    bootstrap_runner_environment()
     parser = build_parser()
     args = parser.parse_args()
     try:
