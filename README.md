@@ -198,7 +198,7 @@ Keep `config.json` local-only. It may contain private delivery settings and shou
 
 ## Project Status
 
-Current release: [v0.3.3](https://github.com/speech115/notes-skill/releases/tag/v0.3.3).
+Current release: [v0.3.4](https://github.com/speech115/notes-skill/releases/tag/v0.3.4).
 
 The release gate expects:
 

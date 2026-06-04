@@ -42,3 +42,10 @@ Default target resolution matches `install.sh`: prefer `~/.codex/skills/notes`, 
 - Optional `--full` checks may still skip external scenarios if local long-form fixtures are missing.
 - If you must inspect or hotfix live state, pull it back into a branch immediately after.
 - Treat git tags as the rollback surface; treat tarball backups as the emergency surface.
+
+## v0.3.4 (2026-06-04)
+
+- Refactor: split `notes-runner` behavior into `scripts/notes_runner_lib/*` (see `docs/adr/0001-notes-runner-runtime-modules.md`).
+- Fix: auto-resolve `digest-runner` from `config.json` and `bin/digest-runner` for Telegram delivery.
+- Docs: Telegram `send_file` troubleshooting; Matt Pocock agent skills scaffold under `docs/agents/`.
+- Chore: ignore local `drafts/` and `outputs/` from git.
