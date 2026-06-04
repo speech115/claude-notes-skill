@@ -61,3 +61,17 @@ Done значит:
 - `bin/status` проходит;
 - для runtime-изменений запущен `bash scripts/release-check.sh` или явно названо, почему он не запускался;
 - если изменение влияет на пользовательский `/notes`, финальный smoke не считается штатным без Telegram-доставки.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub (`speech115/notes-skill`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical triage roles use default label names (`needs-triage`, `ready-for-agent`, …). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` at repo root and `docs/adr/` for ADRs. See `docs/agents/domain.md`.
