@@ -1,5 +1,9 @@
 config.json
 .DS_Store
+drafts/*
+!drafts/.gitkeep
+outputs/*
+!outputs/.gitkeep
 __pycache__/
 *.pyc
 test-fixtures/
